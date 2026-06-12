@@ -764,7 +764,7 @@ export function prepareWorkerAgentForRuntime(agent: any): any {
     const parsed = JSON.parse(agent.parameters || '{}')
     params = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
   } catch {
-    return agent
+    return prepareToollessWorkerAgent(agent)
   }
 
   const maxTokens = readNumberParam(params.maxTokens ?? params.max_tokens)
@@ -780,8 +780,28 @@ export function prepareWorkerAgentForRuntime(agent: any): any {
 
   return {
     ...agent,
+    tools: '[]',
+    system_prompt: buildToollessWorkerSystemPrompt(agent.system_prompt),
     parameters: JSON.stringify(params)
   }
+}
+
+const TOOLLESS_WORKER_SYSTEM_PROMPT = `【主编调用模式】
+你现在是被主编串行调用的工作 Agent。资料检索、章节列表、大纲读取和入库动作由主编负责，你不要调用任何工具，也不要输出 [TOOL:...]。
+请只基于主编给你的任务、设定和补充要求，直接交付可用正文或可执行方案。若被要求写章节，必须输出「## 正文」和完整章节正文，不要先说“我先读取资料”，不要等待下一步确认。`
+
+function prepareToollessWorkerAgent(agent: any): any {
+  return {
+    ...agent,
+    tools: '[]',
+    system_prompt: buildToollessWorkerSystemPrompt(agent.system_prompt)
+  }
+}
+
+function buildToollessWorkerSystemPrompt(systemPrompt: unknown): string {
+  const base = typeof systemPrompt === 'string' ? systemPrompt.trimEnd() : ''
+  if (base.includes('【主编调用模式】')) return base
+  return [base, TOOLLESS_WORKER_SYSTEM_PROMPT].filter(Boolean).join('\n\n')
 }
 
 function readNumberParam(value: unknown): number | undefined {

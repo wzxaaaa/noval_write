@@ -184,10 +184,15 @@ describe('agent orchestrator delivery guards', () => {
 
   it('caps worker generation budget and extends first-token timeout at runtime', () => {
     const agent = prepareWorkerAgentForRuntime({
+      system_prompt: '你是恐怖氛围师。',
+      tools: JSON.stringify(['read_outline', 'list_knowledge', 'list_chapters']),
       parameters: JSON.stringify({ temperature: 0.72, max_tokens: 12000 })
     })
     const params = JSON.parse(agent.parameters)
 
+    expect(agent.tools).toBe('[]')
+    expect(agent.system_prompt).toContain('主编调用模式')
+    expect(agent.system_prompt).toContain('不要调用任何工具')
     expect(params.max_tokens).toBe(6000)
     expect(params.maxTokens).toBe(6000)
     expect(params.first_token_timeout_ms).toBe(180000)
