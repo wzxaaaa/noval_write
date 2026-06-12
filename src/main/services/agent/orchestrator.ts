@@ -54,6 +54,11 @@ export interface WritingContinuityPlan {
   enforceChapterTarget: boolean
 }
 
+export interface CallAgentInput {
+  agentId: string
+  prompt: string
+}
+
 export class Orchestrator {
   private currentControl: WorkflowControl | null = null
 
@@ -222,8 +227,8 @@ export class Orchestrator {
     const workerRuntime = new AgentRuntime(workerToolRegistry)
     const contextManager = new AgentContextManager()
     let workerCallsSinceLastChapterWrite = 0
-    let workerCallAttemptsThisTurn = 0
-    let workerAgentIdsAttemptedThisTurn = new Set<string>()
+    let successfulWorkerCallsThisTurn = 0
+    let workerAgentIdsDeliveredThisTurn = new Set<string>()
     let consecutiveWorkerTimeouts = 0
     let totalWorkerCalls = 0
     let totalSuccessfulChapterWrites = 0
@@ -236,17 +241,17 @@ export class Orchestrator {
     // Register call_agent tool for the moderator
     moderatorToolRegistry.registerTool({
       name: 'call_agent',
-      description: `调用其他 Agent 执行子任务。可用的 Agent: ${workers.map((w: any) => `${w.name}(${w.role})`).join(', ')}`,
+      description: `调用其他 Agent 执行子任务。可用的 Agent: ${workers.map((w: any) => `${w.name}(${w.role})`).join(', ')}。只有拿到可用交付才占用本轮名额；参数错误、模型参数限制、超时或未交付可用结果时，可以修正 prompt 后重试同一个 Agent。`,
       execute: async (input: string) => {
         if (signal.aborted) throw new WorkflowAbortError()
 
-        // Parse: agent_id:\n<agent_id>\nprompt:\n<prompt>
-        const agentMatch = input.match(/agent_id:\s*(\S+)/)
-        const promptMatch = input.match(/prompt:\s*([\s\S]*)/)
-        if (!agentMatch || !promptMatch) return toolFail('格式错误，请使用: agent_id: <id>\\nprompt: <内容>')
+        const parsedCall = parseCallAgentInput(input)
+        if (!parsedCall) {
+          return toolFail('格式错误，请使用: agent_id: <id>\\nprompt: <内容>。也支持 JSON: {"agent_id":"<id>","prompt":"<内容>"}')
+        }
 
-        const targetAgentId = agentMatch[1]
-        const prompt = promptMatch[1].trim()
+        const targetAgentId = parsedCall.agentId
+        const prompt = parsedCall.prompt
         const targetAgent = workers.find((m: any) =>
           m.agent_id === targetAgentId ||
           m.name === targetAgentId ||
@@ -254,16 +259,14 @@ export class Orchestrator {
         )
         if (!targetAgent) return toolFail(`未找到可调用的工作 Agent: ${targetAgentId}。可用: ${workers.map((w: any) => `${w.agent_id}(${w.name})`).join(', ')}。主编不能调用自己。`)
 
-        if (workerAgentIdsAttemptedThisTurn.has(targetAgent.agent_id)) {
-          return toolFail(`本轮已经调用过「${targetAgent.name}」。如果该 Agent 超时或交付失败，请改调其他工作 Agent，不要在同一轮重复等待同一个成员。`)
+        if (workerAgentIdsDeliveredThisTurn.has(targetAgent.agent_id)) {
+          return toolFail(`本轮已经收到过「${targetAgent.name}」的可用交付。请先整合已获得结果；若仍缺材料，下一轮再继续调度。`)
         }
 
-        if (workerCallAttemptsThisTurn >= MAX_WORKER_CALLS_PER_MODERATOR_TURN) {
-          return toolFail(`本轮最多只能调用 ${MAX_WORKER_CALLS_PER_MODERATOR_TURN} 个不同工作 Agent。请先整合已获得结果；若仍缺材料，下一轮再继续调度。`)
+        if (successfulWorkerCallsThisTurn >= MAX_WORKER_CALLS_PER_MODERATOR_TURN) {
+          return toolFail(`本轮最多只能整合 ${MAX_WORKER_CALLS_PER_MODERATOR_TURN} 个不同工作 Agent 的可用交付。请先整合已获得结果；若仍缺材料，下一轮再继续调度。`)
         }
 
-        workerCallAttemptsThisTurn++
-        workerAgentIdsAttemptedThisTurn.add(targetAgent.agent_id)
         callbacks.onAgentStart(targetAgent.agent_id, targetAgent.name)
         try {
           const nextChapterNumber = chapterRepo.listByProject(projectId).length + 1
@@ -282,6 +285,8 @@ export class Orchestrator {
           }
           if (workerDelivery.ok) {
             workerCallsSinceLastChapterWrite++
+            successfulWorkerCallsThisTurn++
+            workerAgentIdsDeliveredThisTurn.add(targetAgent.agent_id)
           } else {
             callbacks.onAgentThinking(targetAgent.agent_id, `[交付保护] ${workerDelivery.reason}`)
           }
@@ -318,7 +323,7 @@ export class Orchestrator {
           } else {
             consecutiveWorkerTimeouts = 0
           }
-          return toolFail(`调用 ${targetAgent.name} 失败: ${message}`)
+          return toolFail(`调用 ${targetAgent.name} 失败: ${message}。这次失败不会占用本轮工作 Agent 名额；请修正参数或 prompt 后可以重新调用同一 Agent。`)
         }
       }
     })
@@ -390,7 +395,7 @@ export class Orchestrator {
     let conversationMessages: Array<{ role: 'user' | 'assistant'; content: string }> = [
       {
         role: 'user',
-        content: `你是主编 Agent。你的团队有: ${workers.map((w: any) => `- ${w.name} (${w.role}, ID: ${w.agent_id})`).join('\n')}\n\n任务: ${inputContext}\n\n你的职责是调度、审核、整合，不是绕过团队自己完成正文。请先分析任务，然后必须使用 [TOOL:call_agent] agent_id: <agent_id>\nprompt: <你的指令>\n[/TOOL] 调用工作 Agent。每轮最多调用 ${MAX_WORKER_CALLS_PER_MODERATOR_TURN} 个工作 Agent；写章节时优先调用 1 个主笔 Agent 拿完整正文，再按需补调规则/线索/氛围。拿到工作 Agent 结果后，再审核、整合并使用章节工具入库。${buildModeratorCompletionInstruction(writingPlan)}`
+        content: `你是主编 Agent。你的团队有: ${workers.map((w: any) => `- ${w.name} (${w.role}, ID: ${w.agent_id})`).join('\n')}\n\n任务: ${inputContext}\n\n你的职责是调度、审核、整合，不是绕过团队自己完成正文。请先分析任务，然后必须使用 [TOOL:call_agent] agent_id: <agent_id>\nprompt: <你的指令>\n[/TOOL] 调用工作 Agent。每轮最多整合 ${MAX_WORKER_CALLS_PER_MODERATOR_TURN} 个工作 Agent 的可用交付；参数错误、模型参数限制、超时或未交付可用结果不算可用交付，请修正 prompt 后重试原 Agent，不要因为一次失败就改调不适合任务的 Agent。写章节时优先调用 1 个主笔 Agent 拿完整正文，再按需补调规则/线索/氛围。拿到工作 Agent 结果后，再审核、整合并使用章节工具入库。${buildModeratorCompletionInstruction(writingPlan)}`
       }
     ]
 
@@ -470,7 +475,7 @@ ${buildWritingContinuityPrompt(writingPlan, needsChapterDelivery)}
 
 重要：
 1. 你必须先使用 call_agent 调用至少一个工作 Agent，拿到该章正文/方案后，才允许创建或写入章节。
-2. 每轮最多调用 ${MAX_WORKER_CALLS_PER_MODERATOR_TURN} 个工作 Agent。默认先调 1 个主笔 Agent 交付完整正文；只有缺规则、线索或氛围时，才补调第 2 个。
+2. 每轮最多整合 ${MAX_WORKER_CALLS_PER_MODERATOR_TURN} 个工作 Agent 的可用交付。调用失败、参数错误、模型参数限制、超时、或子 Agent 未交付可用结果时，不算占用名额；你应该修正 prompt 后重试原 Agent，而不是为了绕开名额限制改调不适合任务的 Agent。
 3. 每写入一章后，下一章必须重新调用至少一个工作 Agent，不能用旧调用记录连续自己写。
 4. 你必须使用 create_chapter 或 write_chapter 工具将每章正文实际写入数据库，仅在工具调用成功返回后才视为该章完成。
 5. 不要假设章节已存在，每次都必须显式调用工具。
@@ -503,8 +508,8 @@ ${buildWritingContinuityPrompt(writingPlan, needsChapterDelivery)}
         }
 
         const workerCallsBeforeTurn = totalWorkerCalls
-        workerCallAttemptsThisTurn = 0
-        workerAgentIdsAttemptedThisTurn = new Set<string>()
+        successfulWorkerCallsThisTurn = 0
+        workerAgentIdsDeliveredThisTurn = new Set<string>()
         const result = await moderatorRuntime.execute(
           moderator as any,
           conversationMessages,
@@ -609,7 +614,7 @@ ${buildWritingContinuityPrompt(writingPlan, needsChapterDelivery)}
         if (toolSummary && !result.content.includes('[WORKFLOW_COMPLETE]')) {
           conversationMessages.push({
             role: 'user',
-            content: `以下是工具执行结果:\n${toolSummary}\n\n请继续。每轮最多调用 ${MAX_WORKER_CALLS_PER_MODERATOR_TURN} 个工作 Agent，优先整合已拿到的结果。若 call_agent 提示“未交付可用结果”，必须重新调用该 Agent 或改调其他 Agent，并明确要求交付完整章节正文/可执行方案，不能等待确认。若章节写入工具被拦截，说明你还没有为该章成功调用工作 Agent，必须先调用 call_agent。${buildContinueInstruction(writingPlan)}`
+            content: `以下是工具执行结果:\n${toolSummary}\n\n请继续。每轮最多整合 ${MAX_WORKER_CALLS_PER_MODERATOR_TURN} 个工作 Agent 的可用交付，优先整合已拿到的结果。若 call_agent 提示参数错误、模型参数限制、超时或“未交付可用结果”，这不占用名额；请修正 prompt 后重试同一个最适合任务的 Agent，并明确要求交付完整章节正文/可执行方案，不能等待确认。若章节写入工具被拦截，说明你还没有为该章成功调用工作 Agent，必须先调用 call_agent。${buildContinueInstruction(writingPlan)}`
           })
         }
       } catch (err) {
@@ -796,6 +801,71 @@ function countSuccessfulOutlineWrites(result: AgentRunResult): number {
 function truncateText(text: string, maxLength: number): string {
   const trimmed = text.trim().replace(/\s+/g, ' ')
   return trimmed.length <= maxLength ? trimmed : `${trimmed.slice(0, maxLength)}...`
+}
+
+export function parseCallAgentInput(input: string): CallAgentInput | null {
+  const jsonParsed = parseCallAgentJsonInput(input)
+  if (jsonParsed) return jsonParsed
+
+  const agentId = readLooseCallAgentField(input, ['agent_id', 'agentId', 'agent', 'target_agent', 'targetAgent'])
+  const prompt = readLooseCallAgentPrompt(input)
+  if (!agentId || !prompt) return null
+
+  return {
+    agentId: stripWrappingQuotes(agentId),
+    prompt: stripWrappingQuotes(prompt)
+  }
+}
+
+function parseCallAgentJsonInput(input: string): CallAgentInput | null {
+  const trimmed = input.trim()
+  if (!trimmed) return null
+
+  const candidates = [trimmed]
+  const objectMatch = trimmed.match(/\{[\s\S]*\}/)
+  if (objectMatch && objectMatch[0] !== trimmed) candidates.push(objectMatch[0])
+
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate)
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue
+      const record = parsed as Record<string, unknown>
+      const agentId = readRecordString(record, ['agent_id', 'agentId', 'agent', 'target_agent', 'targetAgent', 'name'])
+      const prompt = readRecordString(record, ['prompt', 'instruction', 'task', 'content', 'message'])
+      if (agentId && prompt) return { agentId, prompt }
+    } catch {
+      continue
+    }
+  }
+
+  return null
+}
+
+function readLooseCallAgentField(input: string, names: string[]): string | null {
+  for (const name of names) {
+    const pattern = new RegExp(`^\\s*${name}\\s*[:=]\\s*(.+?)\\s*$`, 'im')
+    const match = input.match(pattern)
+    if (match?.[1]?.trim()) return match[1].trim()
+  }
+  return null
+}
+
+function readLooseCallAgentPrompt(input: string): string | null {
+  const promptMatch = input.match(/^\s*(?:prompt|instruction|task|content|message)\s*[:=]\s*([\s\S]*)$/im)
+  const prompt = promptMatch?.[1]?.trim()
+  return prompt || null
+}
+
+function readRecordString(record: Record<string, unknown>, keys: string[]): string | null {
+  for (const key of keys) {
+    const value = record[key]
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  }
+  return null
+}
+
+function stripWrappingQuotes(value: string): string {
+  return value.trim().replace(/^["'“”‘’]+|["'“”‘’]+$/g, '').trim()
 }
 
 export function buildWritingContinuityPlan(input: string): WritingContinuityPlan {

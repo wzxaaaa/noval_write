@@ -19,11 +19,9 @@ describe('openai compatible adapter provider quirks', () => {
   })
 
   it('omits temperature for Kimi K2 fixed-temperature models', () => {
-    expect(normalizeKimiCompletionParams({ temperature: 0.82, maxTokens: 8192 }, 'kimi-k2.6')).toEqual({
+    expect(normalizeKimiCompletionParams({ temperature: 0.82, topP: 0.92, top_p: 0.92, frequencyPenalty: 0.2, presencePenalty: 0.3, maxTokens: 8192 }, 'kimi-k2.6')).toEqual({
       maxTokens: 8192
     })
-    expect(normalizeKimiCompletionParams({ temperature: 1, topP: 0.9 }, 'kimi-k2.5-preview')).toEqual({
-      topP: 0.9
-    })
+    expect(normalizeKimiCompletionParams({ temperature: 1, topP: 0.9 }, 'kimi-k2.5-preview')).toEqual({})
   })
 })

@@ -24,7 +24,7 @@ export function normalizeKimiCompletionParams(params: AIParams, model: string): 
   const normalized: AIParams = { ...params }
 
   if (isKimiFixedTemperatureModel(model)) {
-    delete normalized.temperature
+    deleteFixedKimiSamplingParams(normalized)
     return normalized
   }
 
@@ -53,4 +53,14 @@ function isKimiModel(model: string): boolean {
 
 function isKimiFixedTemperatureModel(model: string): boolean {
   return /kimi-k2\.(5|6)/i.test(model)
+}
+
+function deleteFixedKimiSamplingParams(params: AIParams): void {
+  delete params.temperature
+  delete params.topP
+  delete params.top_p
+  delete params.frequencyPenalty
+  delete params.frequency_penalty
+  delete params.presencePenalty
+  delete params.presence_penalty
 }

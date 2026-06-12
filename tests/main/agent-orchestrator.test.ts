@@ -10,6 +10,7 @@ import {
   getModeratorMaxRounds,
   isPassiveWorkerOutput,
   isWorkerRuntimeTimeout,
+  parseCallAgentInput,
   prepareWorkerAgentForRuntime,
   shouldContinueWritingIndefinitely,
   shouldRequireChapterDelivery,
@@ -104,6 +105,21 @@ describe('agent orchestrator delivery guards', () => {
 
     expect(shortProblem).toContain('章节篇幅不足')
     expect(longEnough).toBeNull()
+  })
+
+  it('parses call_agent input from loose fields and JSON', () => {
+    expect(parseCallAgentInput('agent_id: writer\nprompt:\n请写第一章，完整正文。')).toEqual({
+      agentId: 'writer',
+      prompt: '请写第一章，完整正文。'
+    })
+    expect(parseCallAgentInput('{"agent_id":"rules","prompt":"设计灵魂劳动合同规则"}')).toEqual({
+      agentId: 'rules',
+      prompt: '设计灵魂劳动合同规则'
+    })
+    expect(parseCallAgentInput('agent: "氛围师"\ninstruction: 写出猝死入职大厅的恐怖氛围')).toEqual({
+      agentId: '氛围师',
+      prompt: '写出猝死入职大厅的恐怖氛围'
+    })
   })
 
   it('accepts Chinese outline type aliases for agent outline tools', () => {
