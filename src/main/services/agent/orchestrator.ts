@@ -6,6 +6,7 @@ import { AgentContextManager } from './context-manager'
 import { assessAgentOutput, inspectChinesePunctuation, validateChapterDraft } from './quality-monitor'
 import { MessageBus } from './message-bus'
 import { ToolRegistry, toolFail, toolOk } from './tool-registry'
+import { countContentChars } from '../../../shared/textMetrics'
 
 export type CollaborationMode = 'round_robin' | 'moderator'
 
@@ -14,6 +15,11 @@ const MAX_CONSECUTIVE_WORKER_TIMEOUTS = 2
 const WORKER_MAX_TOKENS_CAP = 6000
 const WORKER_FIRST_TOKEN_TIMEOUT_MS = 180_000
 const WORKER_STREAM_IDLE_TIMEOUT_MS = 120_000
+const DEFAULT_MODERATOR_MAX_ROUNDS = 30
+const DEFAULT_CHAPTER_TARGET_CHARS = 2000
+const MIN_CHAPTER_TARGET_CHARS = 300
+const MAX_CHAPTER_TARGET_CHARS = 20000
+const MIN_CHAPTER_TARGET_RATIO = 0.6
 
 export interface WorkflowCallbacks {
   onAgentStart: (agentId: string, agentName: string) => void
@@ -39,6 +45,13 @@ class WorkflowAbortError extends Error {
     super('工作流已被用户停止')
     this.name = 'WorkflowAbortError'
   }
+}
+
+export interface WritingContinuityPlan {
+  continuous: boolean
+  targetChapterChars: number
+  hasExplicitChapterTarget: boolean
+  enforceChapterTarget: boolean
 }
 
 export class Orchestrator {
@@ -218,6 +231,7 @@ export class Orchestrator {
     const expectedChapterWrites = estimateRequestedChapterCount(inputContext)
     const needsChapterDelivery = shouldRequireChapterDelivery(inputContext)
     const needsOutlineDelivery = shouldRequireOutlineDelivery(inputContext)
+    const writingPlan = buildWritingContinuityPlan(inputContext)
 
     // Register call_agent tool for the moderator
     moderatorToolRegistry.registerTool({
@@ -252,9 +266,11 @@ export class Orchestrator {
         workerAgentIdsAttemptedThisTurn.add(targetAgent.agent_id)
         callbacks.onAgentStart(targetAgent.agent_id, targetAgent.name)
         try {
+          const nextChapterNumber = chapterRepo.listByProject(projectId).length + 1
+          const workerPrompt = enrichWorkerPrompt(prompt, writingPlan, needsChapterDelivery, nextChapterNumber)
           const result = await workerRuntime.execute(
             prepareWorkerAgentForRuntime(targetAgent) as any,
-            [{ role: 'user', content: prompt }],
+            [{ role: 'user', content: workerPrompt }],
             (token) => callbacks.onAgentToken(targetAgent.agent_id, token),
             (thinking) => callbacks.onAgentThinking(targetAgent.agent_id, thinking)
           )
@@ -297,10 +313,7 @@ export class Orchestrator {
               `[运行保护] ${targetAgent.name} 无响应：${message}（连续 ${consecutiveWorkerTimeouts}/${MAX_CONSECUTIVE_WORKER_TIMEOUTS}）`
             )
             if (consecutiveWorkerTimeouts >= MAX_CONSECUTIVE_WORKER_TIMEOUTS) {
-              return toolFail(
-                buildWorkerTimeoutStopMessage(consecutiveWorkerTimeouts),
-                { abortAgentRun: true, reason: 'worker_timeout' }
-              )
+              return toolFail(buildWorkerTimeoutRecoveryMessage(consecutiveWorkerTimeouts))
             }
           } else {
             consecutiveWorkerTimeouts = 0
@@ -318,6 +331,9 @@ export class Orchestrator {
 	          return toolFail('已拦截：主编不能绕过工作 Agent 直接创建章节。请先使用 call_agent 调用至少一个子 Agent 获取该章正文或方案，再创建章节。')
         }
 
+        const lengthProblem = getChapterTargetLengthProblem(input, writingPlan)
+        if (lengthProblem) return toolFail(lengthProblem)
+
         const output = await workerToolRegistry.execute('create_chapter', input)
         if (output.ok) {
           workerCallsSinceLastChapterWrite = 0
@@ -334,6 +350,9 @@ export class Orchestrator {
         if (workerCallsSinceLastChapterWrite <= 0) {
 	          return toolFail('已拦截：主编不能绕过工作 Agent 直接写入章节。请先使用 call_agent 调用至少一个子 Agent 获取该章正文或方案，再写入章节。')
         }
+
+        const lengthProblem = getChapterTargetLengthProblem(input, writingPlan)
+        if (lengthProblem) return toolFail(lengthProblem)
 
         const output = await workerToolRegistry.execute('write_chapter', input)
         if (output.ok) {
@@ -363,7 +382,7 @@ export class Orchestrator {
 
     // Moderator loop
     let round = 0
-    const maxRounds = 30
+    const maxRounds = getModeratorMaxRounds(inputContext)
     const initialChapterCount = chapterRepo.listByProject(projectId).length
     let lastCompletedChapterCount = initialChapterCount
     let consecutiveCompleteWithoutNewChapters = 0
@@ -371,7 +390,7 @@ export class Orchestrator {
     let conversationMessages: Array<{ role: 'user' | 'assistant'; content: string }> = [
       {
         role: 'user',
-        content: `你是主编 Agent。你的团队有: ${workers.map((w: any) => `- ${w.name} (${w.role}, ID: ${w.agent_id})`).join('\n')}\n\n任务: ${inputContext}\n\n你的职责是调度、审核、整合，不是绕过团队自己完成正文。请先分析任务，然后必须使用 [TOOL:call_agent] agent_id: <agent_id>\nprompt: <你的指令>\n[/TOOL] 调用工作 Agent。每轮最多调用 ${MAX_WORKER_CALLS_PER_MODERATOR_TURN} 个工作 Agent；写章节时优先调用 1 个主笔 Agent 拿完整正文，再按需补调规则/线索/氛围。拿到工作 Agent 结果后，再审核、整合并使用章节工具入库。完成后输出 [WORKFLOW_COMPLETE] 并附上总结。`
+        content: `你是主编 Agent。你的团队有: ${workers.map((w: any) => `- ${w.name} (${w.role}, ID: ${w.agent_id})`).join('\n')}\n\n任务: ${inputContext}\n\n你的职责是调度、审核、整合，不是绕过团队自己完成正文。请先分析任务，然后必须使用 [TOOL:call_agent] agent_id: <agent_id>\nprompt: <你的指令>\n[/TOOL] 调用工作 Agent。每轮最多调用 ${MAX_WORKER_CALLS_PER_MODERATOR_TURN} 个工作 Agent；写章节时优先调用 1 个主笔 Agent 拿完整正文，再按需补调规则/线索/氛围。拿到工作 Agent 结果后，再审核、整合并使用章节工具入库。${buildModeratorCompletionInstruction(writingPlan)}`
       }
     ]
 
@@ -446,7 +465,8 @@ content:
 创作前应先使用 read_outline 读取项目的大纲和细纲，确保内容与已有设定一致。如果大纲/细纲不存在，可使用 write_outline 创建。
 每一章拿到正文后，先使用 fact_check_chapter 做一致性核查；如发现冲突或缺少依据，先修订正文，再创建或写入章节。
 每一章入库前必须做正文终审：补齐自然中文标点，拆开过长无停顿句，修正病句和节奏问题。子 Agent 交来的正文如果缺少逗号、句号或分号，主编必须先润色修订，不能直接入库。
-当用户要求连续创作多章时，按章节顺序循环：规划当前章、调用工作 Agent、核查并审核当前章、创建或写入该章，然后自动继续下一章。单章通过即刻入库，不要等全部章节完成后再统一入库。全部章节都创建或写入后，才输出 [WORKFLOW_COMPLETE]。
+当用户要求连续创作多章时，按章节顺序循环：规划当前章、调用工作 Agent、核查并审核当前章、创建或写入该章，然后自动继续下一章。单章通过即刻入库，不要等全部章节完成后再统一入库。只有用户给出明确章节数量且这些章节都已入库后，才输出 [WORKFLOW_COMPLETE]。
+${buildWritingContinuityPrompt(writingPlan, needsChapterDelivery)}
 
 重要：
 1. 你必须先使用 call_agent 调用至少一个工作 Agent，拿到该章正文/方案后，才允许创建或写入章节。
@@ -502,10 +522,17 @@ content:
         const workerCallsThisTurn = totalWorkerCalls - workerCallsBeforeTurn
 
         if (consecutiveWorkerTimeouts >= MAX_CONSECUTIVE_WORKER_TIMEOUTS) {
-          const message = buildWorkerTimeoutStopMessage(consecutiveWorkerTimeouts)
+          const message = buildWorkerTimeoutRecoveryMessage(consecutiveWorkerTimeouts)
           callbacks.onAgentThinking(moderator.agent_id, `[运行保护] ${message}`)
-          callbacks.onError(new Error(message))
-          return
+          conversationMessages.push({
+            role: 'user',
+            content: `${message}
+
+不要结束工作流。请换一个工作 Agent，或把任务拆成更小的单章请求继续推进。当前目标仍然是继续写作并把下一章实际写入数据库。`
+          })
+          consecutiveWorkerTimeouts = 0
+          round++
+          continue
         }
 
         if (workerCallsThisTurn === 0 && result.toolCalls.length === 0 && !result.content.includes('[WORKFLOW_COMPLETE]')) {
@@ -527,6 +554,9 @@ content:
         lastCompletedChapterCount = currentChapterCount
         consecutiveCompleteWithoutNewChapters = 0
         callbacks.onAgentThinking(moderator.agent_id, `[入库确认] 本轮新增 ${newChaptersThisRound} 章，累计已入库 ${currentChapterCount - initialChapterCount} 章`)
+        if (writingPlan.continuous) {
+          callbacks.onAgentThinking(moderator.agent_id, `[持续写作] 已完成 ${currentChapterCount - initialChapterCount} 章，将自动进入下一章，直到用户停止工作流`)
+        }
       }
 
       if (result.content.includes('[WORKFLOW_COMPLETE]')) {
@@ -535,7 +565,8 @@ content:
           needsOutlineDelivery,
           expectedChapterWrites,
           totalSuccessfulChapterWrites,
-          totalSuccessfulOutlineWrites
+          totalSuccessfulOutlineWrites,
+          continuousWriting: writingPlan.continuous
         })
         if (deliveryProblem) {
           consecutiveCompleteWithoutNewChapters++
@@ -549,7 +580,7 @@ content:
 
 你必须先使用 call_agent 调用至少一个工作 Agent，再使用对应写入工具将结果实际写入数据库。仅输出总结或声明完成是不够的。
 
-请立即调用工作 Agent，然后创建/写入缺失章节。不要再次输出 [WORKFLOW_COMPLETE]，直到所有章节都通过工具调用成功入库。`
+请立即调用工作 Agent，然后创建/写入缺失章节。${writingPlan.continuous ? '这是持续写作任务，不存在“全部章节已完成”；每写完一章就继续下一章，直到用户手动停止工作流。' : '不要再次输出 [WORKFLOW_COMPLETE]，直到所有章节都通过工具调用成功入库。'}`
           })
             round++
             continue
@@ -578,7 +609,7 @@ content:
         if (toolSummary && !result.content.includes('[WORKFLOW_COMPLETE]')) {
           conversationMessages.push({
             role: 'user',
-            content: `以下是工具执行结果:\n${toolSummary}\n\n请继续。每轮最多调用 ${MAX_WORKER_CALLS_PER_MODERATOR_TURN} 个工作 Agent，优先整合已拿到的结果。若 call_agent 提示“未交付可用结果”，必须重新调用该 Agent 或改调其他 Agent，并明确要求交付完整章节正文/可执行方案，不能等待确认。若章节写入工具被拦截，说明你还没有为该章成功调用工作 Agent，必须先调用 call_agent。需要更多工作时继续调用工作 Agent；任务完成且章节已实际入库后，才能输出 [WORKFLOW_COMPLETE]。`
+            content: `以下是工具执行结果:\n${toolSummary}\n\n请继续。每轮最多调用 ${MAX_WORKER_CALLS_PER_MODERATOR_TURN} 个工作 Agent，优先整合已拿到的结果。若 call_agent 提示“未交付可用结果”，必须重新调用该 Agent 或改调其他 Agent，并明确要求交付完整章节正文/可执行方案，不能等待确认。若章节写入工具被拦截，说明你还没有为该章成功调用工作 Agent，必须先调用 call_agent。${buildContinueInstruction(writingPlan)}`
           })
         }
       } catch (err) {
@@ -718,8 +749,8 @@ export function isWorkerRuntimeTimeout(message: string): boolean {
   return /Agent (?:在 \d+ 秒内没有输出|已 \d+ 秒没有继续输出|输出超过 \d+ 秒仍未完成|输出重复退化)/.test(message)
 }
 
-function buildWorkerTimeoutStopMessage(count: number): string {
-  return `连续 ${count} 个不同工作 Agent 在首 token/输出阶段无响应，已停止本轮工作流。请稍后重试、降低任务规模，或切换到响应更稳定的模型/API。`
+function buildWorkerTimeoutRecoveryMessage(count: number): string {
+  return `连续 ${count} 次工作 Agent 在首 token/输出阶段无响应。系统已将其视为单次成员失败，而不是整个工作流失败；请换用其他工作 Agent、缩小本章任务，或降低单次输出压力后继续调度。`
 }
 
 export function prepareWorkerAgentForRuntime(agent: any): any {
@@ -767,8 +798,128 @@ function truncateText(text: string, maxLength: number): string {
   return trimmed.length <= maxLength ? trimmed : `${trimmed.slice(0, maxLength)}...`
 }
 
+export function buildWritingContinuityPlan(input: string): WritingContinuityPlan {
+  const explicitTarget = estimateChapterTargetChars(input)
+  const continuous = shouldContinueWritingIndefinitely(input)
+  return {
+    continuous,
+    targetChapterChars: explicitTarget ?? DEFAULT_CHAPTER_TARGET_CHARS,
+    hasExplicitChapterTarget: explicitTarget !== null,
+    enforceChapterTarget: continuous || explicitTarget !== null
+  }
+}
+
+export function shouldContinueWritingIndefinitely(input: string): boolean {
+  const compact = input.replace(/\s+/g, '')
+  if (!compact) return false
+  const indefinite = /(一直|不停|不要停|别停|持续|长期|无限|无尽|写下去|一直写|持续写|连续不断|自动继续|直到.*停止|直到.*叫停|直到.*说停|直到用户.*停)/.test(compact)
+  const writing = /(写|创作|生成|续写|连载|章节|正文|成稿)/.test(compact)
+  return indefinite && writing
+}
+
+export function estimateChapterTargetChars(input: string): number | null {
+  const compact = input.replace(/\s+/g, '')
+  const arabicPatterns = [
+    /(?:每章|单章|一章|章节)(?:字数|正文|内容|篇幅)?(?:约|大约|左右|不少于|至少|目标|控制在)?(\d{3,5})(?:字|字符)?/,
+    /(\d{3,5})(?:字|字符)(?:左右|上下|以内|以上)?(?:每章|单章|一章|一节|章节)/,
+    /(?:每章|单章|一章|章节).{0,6}?(\d{3,5})(?:字|字符)/
+  ]
+  for (const pattern of arabicPatterns) {
+    const match = compact.match(pattern)
+    if (match) return clampChapterTarget(Number(match[1]))
+  }
+
+  const chinesePatterns = [
+    /(?:每章|单章|一章|章节)(?:字数|正文|内容|篇幅)?(?:约|大约|左右|不少于|至少|目标|控制在)?([零〇一二两三四五六七八九十百千万]{2,12})(?:字|字符)/,
+    /([零〇一二两三四五六七八九十百千万]{2,12})(?:字|字符)(?:左右|上下|以内|以上)?(?:每章|单章|一章|一节|章节)/
+  ]
+  for (const pattern of chinesePatterns) {
+    const match = compact.match(pattern)
+    if (!match) continue
+    const value = parseChineseInteger(match[1])
+    if (value !== null) return clampChapterTarget(value)
+  }
+
+  return null
+}
+
+export function getModeratorMaxRounds(input: string): number {
+  if (shouldContinueWritingIndefinitely(input)) return Number.POSITIVE_INFINITY
+  const requestedChapters = estimateRequestedChapterCount(input)
+  if (requestedChapters === null) return DEFAULT_MODERATOR_MAX_ROUNDS
+  return Math.max(DEFAULT_MODERATOR_MAX_ROUNDS, requestedChapters * 4 + 10)
+}
+
+function buildModeratorCompletionInstruction(plan: WritingContinuityPlan): string {
+  if (plan.continuous) {
+    return '这是持续写作任务；不要输出 [WORKFLOW_COMPLETE]，也不要因为已经写了若干章就停下。只有用户手动停止工作流，或用户注入新指令要求结束时，才停止继续创作。'
+  }
+  return '完成后输出 [WORKFLOW_COMPLETE] 并附上总结。'
+}
+
+function buildWritingContinuityPrompt(plan: WritingContinuityPlan, needsChapterDelivery: boolean): string {
+  if (!needsChapterDelivery) return ''
+
+  const lines = [
+    `章节篇幅要求：每章目标约 ${plan.targetChapterChars} 字。正文入库前必须检查篇幅；如果明显不足，先补写到目标篇幅附近，再调用 create_chapter/write_chapter。`
+  ]
+
+  if (plan.continuous) {
+    lines.push('持续写作模式：用户要求一直写下去。你必须一章一章循环写作、审核、入库，然后自动进入下一章。不要输出 [WORKFLOW_COMPLETE]，不要等待用户确认下一章，直到用户点击停止或注入明确结束指令。')
+  }
+
+  return `\n${lines.join('\n')}\n`
+}
+
+function buildContinueInstruction(plan: WritingContinuityPlan): string {
+  if (plan.continuous) {
+    return `持续写作模式仍在进行：如果本轮已有章节成功入库，请立即规划并调度下一章；如果本轮尚未入库，请修正失败点后继续。每章目标约 ${plan.targetChapterChars} 字，不要输出 [WORKFLOW_COMPLETE]。`
+  }
+  return '需要更多工作时继续调用工作 Agent；任务完成且章节已实际入库后，才能输出 [WORKFLOW_COMPLETE]。'
+}
+
+function enrichWorkerPrompt(prompt: string, plan: WritingContinuityPlan, needsChapterDelivery: boolean, nextChapterNumber: number): string {
+  if (!needsChapterDelivery) return prompt
+
+  const additions = [
+    '【系统补充交付要求】',
+    `本次任务需要可直接推进的章节正文或明确可执行方案。若写正文，请按下一章顺序推进，当前预估应写第 ${nextChapterNumber} 章。`,
+    `单章目标约 ${plan.targetChapterChars} 字；不要只写梗概、总结、片段或等待主编裁定。`,
+    '正文必须有自然中文标点，结尾要形成章节钩子，但不要以“等待下一步任务”收尾。'
+  ]
+
+  if (plan.continuous) {
+    additions.push('这是持续写作链路的一环：交付本章后，主编会继续调度下一章。你只需要把当前章写完整。')
+  }
+
+  return `${prompt}\n\n${additions.join('\n')}`
+}
+
+export function getChapterTargetLengthProblem(input: string, plan: WritingContinuityPlan): string | null {
+  if (!plan.enforceChapterTarget) return null
+
+  const content = extractChapterContentFromToolInput(input)
+  if (content === null) return null
+
+  const actualChars = countContentChars(content)
+  const minimumChars = Math.max(80, Math.floor(plan.targetChapterChars * MIN_CHAPTER_TARGET_RATIO))
+  if (actualChars >= minimumChars) return null
+
+  return `章节篇幅不足：当前约 ${actualChars} 字，目标约 ${plan.targetChapterChars} 字，至少应达到 ${minimumChars} 字后再入库。请继续调用工作 Agent 补足本章正文，不要用摘要或片段冒充完整章节。`
+}
+
+function extractChapterContentFromToolInput(input: string): string | null {
+  const contentMatch = input.match(/content:\s*([\s\S]*)/)
+  return contentMatch ? contentMatch[1].trim() : null
+}
+
+function clampChapterTarget(value: number): number | null {
+  if (!Number.isFinite(value) || value < MIN_CHAPTER_TARGET_CHARS) return null
+  return Math.min(MAX_CHAPTER_TARGET_CHARS, Math.floor(value))
+}
+
 export function shouldRequireChapterDelivery(input: string): boolean {
-  return /(正文|章节|第.{1,6}章|写.{0,6}章|续写|下一章|下一场|入库|放入正文)/.test(input)
+  return /(正文|章节|第.{1,6}章|写.{0,6}章|续写|写下去|下一章|下一场|入库|放入正文)/.test(input)
 }
 
 export function shouldRequireOutlineDelivery(input: string): boolean {
@@ -788,6 +939,7 @@ export function estimateRequestedChapterCount(input: string): number | null {
 function parseChineseInteger(input: string): number | null {
   const digits: Record<string, number> = {
     零: 0,
+    〇: 0,
     一: 1,
     二: 2,
     两: 2,
@@ -799,13 +951,37 @@ function parseChineseInteger(input: string): number | null {
     八: 8,
     九: 9
   }
-  if (input === '十') return 10
-  const tenMatch = input.match(/^([一二三四五六七八九两])?十([一二三四五六七八九])?$/)
-  if (tenMatch) {
-    return (tenMatch[1] ? digits[tenMatch[1]] : 1) * 10 + (tenMatch[2] ? digits[tenMatch[2]] : 0)
+  const units: Record<string, number> = {
+    十: 10,
+    百: 100,
+    千: 1000
   }
-  if (input.length === 1 && digits[input] !== undefined) return digits[input]
-  return null
+  if (!/^[零〇一二两三四五六七八九十百千万]+$/.test(input)) return null
+
+  let total = 0
+  let section = 0
+  let number = 0
+  for (const char of input) {
+    if (digits[char] !== undefined) {
+      number = digits[char]
+      continue
+    }
+    if (units[char] !== undefined) {
+      section += (number || 1) * units[char]
+      number = 0
+      continue
+    }
+    if (char === '万') {
+      total += (section + number) * 10000
+      section = 0
+      number = 0
+      continue
+    }
+    return null
+  }
+
+  const value = total + section + number
+  return value > 0 ? value : null
 }
 
 export function getDeliveryProblem(params: {
@@ -814,10 +990,14 @@ export function getDeliveryProblem(params: {
   expectedChapterWrites: number | null
   totalSuccessfulChapterWrites: number
   totalSuccessfulOutlineWrites: number
+  continuousWriting?: boolean
 }): string | null {
   const totalDeliveries = params.totalSuccessfulChapterWrites + params.totalSuccessfulOutlineWrites
   if (totalDeliveries === 0) return '没有任何成功写入动作'
   if (params.needsChapterDelivery && params.totalSuccessfulChapterWrites === 0) return '没有成功写入章节正文'
+  if (params.needsChapterDelivery && params.continuousWriting) {
+    return '用户要求持续写作，工作流必须继续下一章，直到用户手动停止'
+  }
   if (params.needsChapterDelivery && params.expectedChapterWrites !== null && params.totalSuccessfulChapterWrites < params.expectedChapterWrites) {
     return `用户要求约 ${params.expectedChapterWrites} 章，但只成功写入 ${params.totalSuccessfulChapterWrites} 次章节`
   }

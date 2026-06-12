@@ -1,12 +1,17 @@
 import { describe, expect, it } from 'vitest'
 import {
   assessWorkerDelivery,
+  buildWritingContinuityPlan,
+  estimateChapterTargetChars,
   estimateRequestedChapterCount,
   extractUsableWorkerContent,
+  getChapterTargetLengthProblem,
   getDeliveryProblem,
+  getModeratorMaxRounds,
   isPassiveWorkerOutput,
   isWorkerRuntimeTimeout,
   prepareWorkerAgentForRuntime,
+  shouldContinueWritingIndefinitely,
   shouldRequireChapterDelivery,
   shouldRequireOutlineDelivery
 } from '../../src/main/services/agent/orchestrator'
@@ -40,8 +45,65 @@ describe('agent orchestrator delivery guards', () => {
   it('detects requested chapter counts and delivery intent from Chinese prompts', () => {
     expect(estimateRequestedChapterCount('先写前10章')).toBe(10)
     expect(estimateRequestedChapterCount('连续写三章')).toBe(3)
+    expect(estimateRequestedChapterCount('连续写二十五章')).toBe(25)
     expect(shouldRequireChapterDelivery('帮我续写下一章')).toBe(true)
     expect(shouldRequireOutlineDelivery('先创建一个大纲，然后细纲也来点')).toBe(true)
+  })
+
+  it('recognizes continuous writing requests and keeps them open-ended', () => {
+    const prompt = '请连续写作章节，每章字数2000字一直写下去，直到我停止'
+    const plan = buildWritingContinuityPlan(prompt)
+
+    expect(shouldContinueWritingIndefinitely(prompt)).toBe(true)
+    expect(shouldContinueWritingIndefinitely('连续写三章')).toBe(false)
+    expect(estimateChapterTargetChars(prompt)).toBe(2000)
+    expect(plan).toMatchObject({
+      continuous: true,
+      targetChapterChars: 2000,
+      hasExplicitChapterTarget: true,
+      enforceChapterTarget: true
+    })
+    expect(getModeratorMaxRounds(prompt)).toBe(Number.POSITIVE_INFINITY)
+  })
+
+  it('defaults continuous writing to 2000 chars per chapter when no target is provided', () => {
+    const plan = buildWritingContinuityPlan('从下一章开始一直写下去，不要停')
+
+    expect(plan.continuous).toBe(true)
+    expect(plan.targetChapterChars).toBe(2000)
+    expect(plan.enforceChapterTarget).toBe(true)
+  })
+
+  it('parses Chinese chapter target lengths', () => {
+    expect(estimateChapterTargetChars('每章两千字左右')).toBe(2000)
+    expect(estimateChapterTargetChars('单章一千五百字')).toBe(1500)
+  })
+
+  it('scales finite moderator rounds with requested chapter count', () => {
+    expect(getModeratorMaxRounds('连续写十章')).toBeGreaterThanOrEqual(50)
+    expect(Number.isFinite(getModeratorMaxRounds('连续写十章'))).toBe(true)
+  })
+
+  it('does not allow continuous writing tasks to complete after a chapter write', () => {
+    const problem = getDeliveryProblem({
+      needsChapterDelivery: true,
+      needsOutlineDelivery: false,
+      expectedChapterWrites: null,
+      totalSuccessfulChapterWrites: 3,
+      totalSuccessfulOutlineWrites: 0,
+      continuousWriting: true
+    })
+
+    expect(problem).toContain('持续写作')
+  })
+
+  it('blocks under-length chapters when a continuous target is active', () => {
+    const plan = buildWritingContinuityPlan('每章2000字一直写下去')
+    const shortProblem = getChapterTargetLengthProblem('title: 第一章\ncontent:\n短短一段。', plan)
+    const longEnough = getChapterTargetLengthProblem(`title: 第一章\ncontent:\n${'风声推着灯影往前走，'.repeat(180)}`, plan)
+
+    expect(shortProblem).toContain('章节篇幅不足')
+    expect(longEnough).toBeNull()
   })
 
   it('accepts Chinese outline type aliases for agent outline tools', () => {
