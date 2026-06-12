@@ -1,0 +1,206 @@
+import React, { useState, useEffect } from 'react'
+import { useAIStore } from '../../stores/ai.store'
+import type { ProviderConfig as ProviderConfigData } from '../../../preload/types'
+
+interface ProviderConfigProps {
+  onClose: () => void
+}
+
+type ProviderKind = ProviderConfigData['provider']
+
+interface ProviderFormState {
+  name: string
+  provider: ProviderKind
+  api_key: string
+  base_url: string
+  model: string
+  parameters: string
+  is_default: boolean
+}
+
+export function ProviderConfig({ onClose }: ProviderConfigProps) {
+  return (
+    <div className="modal-overlay">
+      <div className="modal provider-config-modal">
+        <div className="modal-header">
+          <h2>AI 提供商配置</h2>
+          <button onClick={onClose}>✕</button>
+        </div>
+        <ProviderConfigContent />
+      </div>
+    </div>
+  )
+}
+
+export function ProviderConfigContent() {
+  const { providers, setProviders, addProvider, updateProvider, removeProvider } = useAIStore()
+  const [editingProvider, setEditingProvider] = useState<string | null>(null)
+  const [form, setForm] = useState<ProviderFormState>({
+    name: '',
+    provider: 'anthropic',
+    api_key: '',
+    base_url: '',
+    model: '',
+    parameters: '{}',
+    is_default: false
+  })
+  const [testResult, setTestResult] = useState<string | null>(null)
+
+  useEffect(() => {
+    window.electronAPI.ai.listProviders().then(setProviders)
+  }, [])
+
+  const handleSave = async () => {
+    if (!form.name || !form.api_key || !form.model) return
+
+    const params = {
+      name: form.name,
+      provider: form.provider,
+      api_key: form.api_key,
+      base_url: form.base_url || undefined,
+      model: form.model,
+      parameters: JSON.parse(form.parameters),
+      is_default: form.is_default
+    }
+
+    if (editingProvider) {
+      await window.electronAPI.ai.updateProvider(editingProvider, params)
+      updateProvider(editingProvider, { ...params, parameters: JSON.stringify(params.parameters), is_default: params.is_default ? 1 : 0 } as any)
+    } else {
+      const created = await window.electronAPI.ai.createProvider(params)
+      addProvider(created)
+    }
+
+    resetForm()
+  }
+
+  const handleTest = async (configId: string) => {
+    setTestResult('测试中...')
+    const result = await window.electronAPI.ai.testConnection(configId)
+    setTestResult(result.ok ? '连接成功' : `失败: ${result.error}`)
+  }
+
+  const resetForm = () => {
+    setEditingProvider(null)
+    setForm({ name: '', provider: 'anthropic', api_key: '', base_url: '', model: '', parameters: '{}', is_default: false })
+    setTestResult(null)
+  }
+
+  const modelOptions: Record<string, string[]> = {
+    anthropic: ['claude-sonnet-4-6', 'claude-opus-4-7', 'claude-haiku-4-5-20251001'],
+    openai: ['gpt-4o', 'gpt-4-turbo', 'gpt-4', 'gpt-3.5-turbo'],
+    'openai-compat': ['local-model']
+  }
+  const parameterPlaceholder = form.provider === 'openai-compat'
+    ? `{
+  "temperature": 0.82,
+  "top_p": 0.92,
+  "maxTokens": 8192,
+  "frequency_penalty": 0.15,
+  "presence_penalty": 0.25
+}`
+    : `{
+  "temperature": 0.75,
+  "top_p": 0.9,
+  "maxTokens": 8192
+}`
+
+  return (
+    <div className="modal-body settings-tab-body">
+          <div className="provider-list">
+            {providers.map(p => (
+              <div key={p.id} className={`provider-card ${editingProvider === p.id ? 'editing' : ''}`}>
+                <div className="provider-info">
+                  <span className="provider-name">{p.name}</span>
+                  <span className="provider-badge">{p.provider}</span>
+                  <span className="provider-model">{p.model}</span>
+                  {p.is_default === 1 && <span className="provider-default">默认</span>}
+                </div>
+                <div className="provider-actions">
+                  <button onClick={() => {
+                    setEditingProvider(p.id)
+                    setForm({
+                      name: p.name,
+                      provider: p.provider,
+                      api_key: p.api_key,
+                      base_url: p.base_url || '',
+                      model: p.model,
+                      parameters: p.parameters,
+                      is_default: p.is_default === 1
+                    })
+                  }}>编辑</button>
+                  <button onClick={() => handleTest(p.id)}>测试</button>
+                  <button onClick={async () => {
+                    await window.electronAPI.ai.deleteProvider(p.id)
+                    removeProvider(p.id)
+                  }}>删除</button>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="provider-form">
+            <h3>{editingProvider ? '编辑配置' : '新建配置'}</h3>
+
+            <label>
+              名称
+              <input value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} placeholder="我的 Claude" />
+            </label>
+
+            <label>
+              提供商
+              <select value={form.provider} onChange={e => setForm({ ...form, provider: e.target.value as ProviderKind, model: '' })}>
+                <option value="anthropic">Anthropic (Claude)</option>
+                <option value="openai">OpenAI</option>
+                <option value="openai-compat">OpenAI 兼容 (Ollama/vLLM/DeepSeek)</option>
+              </select>
+            </label>
+
+            <label>
+              API Key
+              <input type="password" value={form.api_key} onChange={e => setForm({ ...form, api_key: e.target.value })} placeholder="sk-..." />
+            </label>
+
+            {form.provider === 'openai-compat' && (
+              <label>
+                Base URL
+                <input value={form.base_url} onChange={e => setForm({ ...form, base_url: e.target.value })} placeholder="http://localhost:11434/v1" />
+              </label>
+            )}
+
+            <label>
+              模型
+              <select value={form.model} onChange={e => setForm({ ...form, model: e.target.value })}>
+                <option value="">选择模型...</option>
+                {modelOptions[form.provider].map(m => (
+                  <option key={m} value={m}>{m}</option>
+                ))}
+              </select>
+              <input value={form.model} onChange={e => setForm({ ...form, model: e.target.value })} placeholder="或输入自定义模型名" />
+            </label>
+
+            <label>
+              参数 (JSON)
+              <textarea
+                value={form.parameters}
+                onChange={e => setForm({ ...form, parameters: e.target.value })}
+                placeholder={parameterPlaceholder}
+                rows={form.provider === 'openai-compat' ? 7 : 5}
+              />
+            </label>
+
+            <label className="checkbox-label">
+              <input type="checkbox" checked={form.is_default} onChange={e => setForm({ ...form, is_default: e.target.checked })} />
+              设为默认
+            </label>
+
+            <div className="form-actions">
+              <button onClick={handleSave}>{editingProvider ? '更新' : '保存'}</button>
+              {editingProvider && <button onClick={resetForm}>取消</button>}
+            </div>
+
+            {testResult && <div className="test-result">{testResult}</div>}
+          </div>
+    </div>
+  )
+}
