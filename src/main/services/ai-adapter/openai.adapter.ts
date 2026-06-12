@@ -21,7 +21,7 @@ export class OpenAIAdapter extends BaseAIAdapter {
   }
 
   async chat(messages: AIChatMessage[], params?: AIParams): Promise<{ content: string; usage: { inputTokens: number; outputTokens: number } }> {
-    const merged = this.mergeParams(params)
+    const merged = this.normalizeCompletionParams(this.mergeParams(params))
     const resp = await this.client.chat.completions.create({
       model: this.model,
       messages: messages.map(m => ({ role: m.role, content: m.content })),
@@ -45,7 +45,7 @@ export class OpenAIAdapter extends BaseAIAdapter {
 
   async chatStream(messages: AIChatMessage[], callbacks: AIStreamCallbacks, params?: AIParams): Promise<void> {
     try {
-      const merged = this.mergeParams(params)
+      const merged = this.normalizeCompletionParams(this.mergeParams(params))
       const stream = await this.client.chat.completions.create({
         model: this.model,
         messages: messages.map(m => ({ role: m.role, content: m.content })),
@@ -106,5 +106,9 @@ export class OpenAIAdapter extends BaseAIAdapter {
     }
 
     return body
+  }
+
+  protected normalizeCompletionParams(params: AIParams): AIParams {
+    return params
   }
 }
