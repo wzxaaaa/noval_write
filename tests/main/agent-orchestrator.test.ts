@@ -10,6 +10,7 @@ import {
   getModeratorMaxRounds,
   isPassiveWorkerOutput,
   isWorkerRuntimeTimeout,
+  MAX_WORKER_CALLS_PER_MODERATOR_TURN,
   parseCallAgentInput,
   prepareWorkerAgentForRuntime,
   shouldContinueWritingIndefinitely,
@@ -19,6 +20,10 @@ import {
 import { parseOutlineToolType } from '../../src/main/services/agent/tool-registry'
 
 describe('agent orchestrator delivery guards', () => {
+  it('keeps moderator worker calls serial', () => {
+    expect(MAX_WORKER_CALLS_PER_MODERATOR_TURN).toBe(1)
+  })
+
   it('does not allow a multi-chapter task to complete after only one write', () => {
     const problem = getDeliveryProblem({
       needsChapterDelivery: true,

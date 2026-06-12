@@ -10,7 +10,7 @@ import { countContentChars } from '../../../shared/textMetrics'
 
 export type CollaborationMode = 'round_robin' | 'moderator'
 
-const MAX_WORKER_CALLS_PER_MODERATOR_TURN = 2
+export const MAX_WORKER_CALLS_PER_MODERATOR_TURN = 1
 const MAX_CONSECUTIVE_WORKER_TIMEOUTS = 2
 const WORKER_MAX_TOKENS_CAP = 6000
 const WORKER_FIRST_TOKEN_TIMEOUT_MS = 180_000
@@ -241,7 +241,7 @@ export class Orchestrator {
     // Register call_agent tool for the moderator
     moderatorToolRegistry.registerTool({
       name: 'call_agent',
-      description: `调用其他 Agent 执行子任务。可用的 Agent: ${workers.map((w: any) => `${w.name}(${w.role})`).join(', ')}。只有拿到可用交付才占用本轮名额；参数错误、模型参数限制、超时或未交付可用结果时，可以修正 prompt 后重试同一个 Agent。`,
+      description: `调用其他 Agent 执行子任务。可用的 Agent: ${workers.map((w: any) => `${w.name}(${w.role})`).join(', ')}。主编模式按串行调度：每轮最多只整合 ${MAX_WORKER_CALLS_PER_MODERATOR_TURN} 个工作 Agent 的可用交付，不要在同一轮并行请求多个工作 Agent。参数错误、模型参数限制、超时或未交付可用结果时，不占用名额，可以修正 prompt 后重试同一个 Agent。`,
       execute: async (input: string) => {
         if (signal.aborted) throw new WorkflowAbortError()
 
@@ -264,7 +264,7 @@ export class Orchestrator {
         }
 
         if (successfulWorkerCallsThisTurn >= MAX_WORKER_CALLS_PER_MODERATOR_TURN) {
-          return toolFail(`本轮最多只能整合 ${MAX_WORKER_CALLS_PER_MODERATOR_TURN} 个不同工作 Agent 的可用交付。请先整合已获得结果；若仍缺材料，下一轮再继续调度。`)
+          return toolFail(`主编模式当前为串行调度，本轮最多只能整合 ${MAX_WORKER_CALLS_PER_MODERATOR_TURN} 个工作 Agent 的可用交付。请先整合已获得结果；若仍缺材料，下一轮再继续调度。`)
         }
 
         callbacks.onAgentStart(targetAgent.agent_id, targetAgent.name)
@@ -395,7 +395,7 @@ export class Orchestrator {
     let conversationMessages: Array<{ role: 'user' | 'assistant'; content: string }> = [
       {
         role: 'user',
-        content: `你是主编 Agent。你的团队有: ${workers.map((w: any) => `- ${w.name} (${w.role}, ID: ${w.agent_id})`).join('\n')}\n\n任务: ${inputContext}\n\n你的职责是调度、审核、整合，不是绕过团队自己完成正文。请先分析任务，然后必须使用 [TOOL:call_agent] agent_id: <agent_id>\nprompt: <你的指令>\n[/TOOL] 调用工作 Agent。每轮最多整合 ${MAX_WORKER_CALLS_PER_MODERATOR_TURN} 个工作 Agent 的可用交付；参数错误、模型参数限制、超时或未交付可用结果不算可用交付，请修正 prompt 后重试原 Agent，不要因为一次失败就改调不适合任务的 Agent。写章节时优先调用 1 个主笔 Agent 拿完整正文，再按需补调规则/线索/氛围。拿到工作 Agent 结果后，再审核、整合并使用章节工具入库。${buildModeratorCompletionInstruction(writingPlan)}`
+        content: `你是主编 Agent。你的团队有: ${workers.map((w: any) => `- ${w.name} (${w.role}, ID: ${w.agent_id})`).join('\n')}\n\n任务: ${inputContext}\n\n你的职责是调度、审核、整合，不是绕过团队自己完成正文。请先分析任务，然后必须使用 [TOOL:call_agent] agent_id: <agent_id>\nprompt: <你的指令>\n[/TOOL] 调用工作 Agent。主编模式使用串行调度：每轮最多只整合 ${MAX_WORKER_CALLS_PER_MODERATOR_TURN} 个工作 Agent 的可用交付，不要在同一轮并行请求多个工作 Agent；如果还需要规则/线索/氛围补充，下一轮再调度。参数错误、模型参数限制、超时或未交付可用结果不算可用交付，请修正 prompt 后重试原 Agent，不要因为一次失败就改调不适合任务的 Agent。写章节时优先调用 1 个主笔 Agent 拿完整正文。拿到工作 Agent 结果后，再审核、整合并使用章节工具入库。${buildModeratorCompletionInstruction(writingPlan)}`
       }
     ]
 
@@ -475,7 +475,7 @@ ${buildWritingContinuityPrompt(writingPlan, needsChapterDelivery)}
 
 重要：
 1. 你必须先使用 call_agent 调用至少一个工作 Agent，拿到该章正文/方案后，才允许创建或写入章节。
-2. 每轮最多整合 ${MAX_WORKER_CALLS_PER_MODERATOR_TURN} 个工作 Agent 的可用交付。调用失败、参数错误、模型参数限制、超时、或子 Agent 未交付可用结果时，不算占用名额；你应该修正 prompt 后重试原 Agent，而不是为了绕开名额限制改调不适合任务的 Agent。
+2. 主编调度必须串行执行：每轮最多整合 ${MAX_WORKER_CALLS_PER_MODERATOR_TURN} 个工作 Agent 的可用交付，不要同轮并行请求多个 Agent。调用失败、参数错误、模型参数限制、超时、或子 Agent 未交付可用结果时，不算占用名额；你应该修正 prompt 后重试原 Agent，而不是为了绕开名额限制改调不适合任务的 Agent。
 3. 每写入一章后，下一章必须重新调用至少一个工作 Agent，不能用旧调用记录连续自己写。
 4. 你必须使用 create_chapter 或 write_chapter 工具将每章正文实际写入数据库，仅在工具调用成功返回后才视为该章完成。
 5. 不要假设章节已存在，每次都必须显式调用工具。
@@ -614,7 +614,7 @@ ${buildWritingContinuityPrompt(writingPlan, needsChapterDelivery)}
         if (toolSummary && !result.content.includes('[WORKFLOW_COMPLETE]')) {
           conversationMessages.push({
             role: 'user',
-            content: `以下是工具执行结果:\n${toolSummary}\n\n请继续。每轮最多整合 ${MAX_WORKER_CALLS_PER_MODERATOR_TURN} 个工作 Agent 的可用交付，优先整合已拿到的结果。若 call_agent 提示参数错误、模型参数限制、超时或“未交付可用结果”，这不占用名额；请修正 prompt 后重试同一个最适合任务的 Agent，并明确要求交付完整章节正文/可执行方案，不能等待确认。若章节写入工具被拦截，说明你还没有为该章成功调用工作 Agent，必须先调用 call_agent。${buildContinueInstruction(writingPlan)}`
+            content: `以下是工具执行结果:\n${toolSummary}\n\n请继续。主编调度按串行执行：每轮最多整合 ${MAX_WORKER_CALLS_PER_MODERATOR_TURN} 个工作 Agent 的可用交付，优先整合已拿到的结果，不要同轮并行请求多个 Agent。若 call_agent 提示参数错误、模型参数限制、超时或“未交付可用结果”，这不占用名额；请修正 prompt 后重试同一个最适合任务的 Agent，并明确要求交付完整章节正文/可执行方案，不能等待确认。若章节写入工具被拦截，说明你还没有为该章成功调用工作 Agent，必须先调用 call_agent。${buildContinueInstruction(writingPlan)}`
           })
         }
       } catch (err) {
