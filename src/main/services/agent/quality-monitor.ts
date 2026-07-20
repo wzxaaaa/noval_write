@@ -25,6 +25,13 @@ export interface TextDegenerationInspection {
   repeatedPhraseCount: number
 }
 
+export interface AiFlavorInspection {
+  ok: boolean
+  score: number
+  issues: string[]
+  samples: string[]
+}
+
 export function assessAgentOutput(content: string, toolCalls: ToolCall[], contextRatio: number = 0): QualityAssessment {
   const issues: string[] = []
   const chapterWriteCalls = toolCalls.filter(tc => tc.tool === 'create_chapter' || tc.tool === 'write_chapter')
@@ -55,6 +62,13 @@ export function assessAgentOutput(content: string, toolCalls: ToolCall[], contex
   const degeneration = inspectTextDegeneration(content)
   if (!degeneration.ok) {
     issues.push(`输出重复退化: ${degeneration.reason}`)
+  }
+
+  if (looksLikeChapterDraft(content)) {
+    const flavor = inspectAiFlavor(content)
+    if (!flavor.ok) {
+      issues.push(`AI 腔偏重(评分 ${flavor.score}): ${flavor.issues.join('；')}`)
+    }
   }
 
   const risk = issues.some(issue => issue.includes('没有对应') || issue.includes('工作总结') || issue.includes('失败'))
@@ -181,6 +195,148 @@ export function inspectTextDegeneration(content: string): TextDegenerationInspec
   }
 
   return { ok: true, repeatedCharRun, repeatedPhraseCount: 0 }
+}
+
+const CLICHE_METAPHORS = [
+  '深海巨兽', '洪水猛兽', '困兽', '野兽般', '巨兽', '冰冷的眼', '手术刀', '教科书般',
+  '像一把', '如同一把', '仿佛整个世界', '空气仿佛凝固', '时间仿佛静止', '时间仿佛凝固',
+  '像被按下了暂停键', '暴风雨前的宁静', '深渊', '棋子', '猎物'
+]
+
+const ABSTRACT_FILLERS = [
+  '说不出的', '难以名状', '无法形容', '莫名的', '某种莫名', '让人发毛', '让人头皮发麻',
+  '拒人于千里', '一种难以', '一股说不清', '五味杂陈', '心情复杂', '百感交集', '不容置疑的'
+]
+
+const PSEUDO_METRIC_CONTEXT = /(指数|权重|置信度|概率|准确率|负荷|可信度|评分|阈值|饱和度|匹配度|相似度)/
+
+/**
+ * 确定性扫描一段正文里的“AI 腔”高发特征，返回评分和可疑片段。
+ * 只作为软信号使用：进入质量提示、喂给审稿/整合 Agent 驱动重写，
+ * 不直接卡住入库，避免误伤导致整章生成失败。
+ */
+export function inspectAiFlavor(content: string): AiFlavorInspection {
+  const plain = content
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;|&#160;/g, ' ')
+  const cjkCount = countMatches(plain, /[㐀-鿿]/g)
+  if (cjkCount < 120) {
+    return { ok: true, score: 0, issues: [], samples: [] }
+  }
+
+  const issues: string[] = []
+  const samples: string[] = []
+  let score = 0
+
+  const antithesis = countAntithesis(plain, samples)
+  if (antithesis >= 2) {
+    issues.push(`否定-肯定对偶警句出现 ${antithesis} 处(如「不是…而是…」「这不是X，这是Y」)，是最典型的 AI 腔，整章此类句式应≤1处`)
+    score += antithesis * 2
+  }
+
+  const pseudo = countPseudoMetrics(plain, samples)
+  if (pseudo >= 3) {
+    issues.push(`伪精确数值 ${pseudo} 处(给情绪/状态打小数分或百分比)，读起来像仪表盘而非小说，应改为具体动作和感官`)
+    score += pseudo
+  }
+
+  const cliche = countPhraseHits(plain, [...CLICHE_METAPHORS, ...ABSTRACT_FILLERS], samples)
+  if (cliche >= 2) {
+    issues.push(`套路喻体/抽象拔高词 ${cliche} 处(如「深海巨兽/手术刀/说不出的…」)，应换成当前场景里的具体画面`)
+    score += cliche
+  }
+
+  const fragment = shortFragmentParagraphRatio(plain)
+  if (fragment.count >= 4 && fragment.ratio >= 0.18) {
+    issues.push(`单句独立成段 ${fragment.count} 处(占段落约 ${Math.round(fragment.ratio * 100)}%)，短句凹节奏过量，整章应≤3处`)
+    score += fragment.count
+  }
+
+  return { ok: score < 6, score, issues, samples: samples.slice(0, 8) }
+}
+
+/** 把 AI 腔检测结果整理成可直接塞进提示词的文字块；无问题时返回空串。 */
+export function formatAiFlavorReport(inspection: AiFlavorInspection): string {
+  if (inspection.ok || inspection.issues.length === 0) return ''
+  const lines = ['【AI 腔自动检测结果 — 以下问题必须在最终稿中消除】']
+  inspection.issues.forEach((issue, index) => lines.push(`${index + 1}. ${issue}`))
+  if (inspection.samples.length > 0) {
+    lines.push(`可疑片段示例：${inspection.samples.map(sample => `「${sample}」`).join('；')}`)
+  }
+  return lines.join('\n')
+}
+
+function countAntithesis(text: string, samples: string[]): number {
+  let count = 0
+  const inline = /(?:这)?(?:并?不是|不只是|不再是|不仅仅?是|并非)[^，。！？\n]{1,30}[，。！？]\s*(?:而是|这才是|这就是|这正是|这是|才是|是)[^，。！？\n]{1,28}[。！？]/g
+  let match: RegExpExecArray | null
+  while ((match = inline.exec(text)) !== null) {
+    count++
+    if (samples.length < 8) samples.push(match[0].trim())
+  }
+
+  const paragraphs = text.split(/\n+/).map(segment => segment.trim()).filter(Boolean)
+  for (let i = 0; i < paragraphs.length - 1; i++) {
+    const first = paragraphs[i]
+    const second = paragraphs[i + 1]
+    if (
+      first.length <= 26 && /^(?:这)?(?:并?不是|不只是|不再是|不仅仅?是|并非)/.test(first) &&
+      second.length <= 26 && /^(?:而是|这才是|这就是|这正是|这是|才是)/.test(second)
+    ) {
+      count++
+      if (samples.length < 8) samples.push(`${first} / ${second}`)
+    }
+  }
+
+  return count
+}
+
+function countPseudoMetrics(text: string, samples: string[]): number {
+  const decimals = text.match(/-?\d{1,4}\.\d{1,2}%?/g) ?? []
+  const percents = text.match(/-?\d{1,3}%/g) ?? []
+  const total = decimals.length + percents.length
+
+  if (total > 0 && samples.length < 8) {
+    const sentences = text.split(/[。！？\n]/)
+    for (const sentence of sentences) {
+      if (PSEUDO_METRIC_CONTEXT.test(sentence) && /-?\d+(?:\.\d+)?%?/.test(sentence)) {
+        samples.push(sentence.trim().slice(0, 40))
+        if (samples.length >= 8) break
+      }
+    }
+  }
+
+  return total
+}
+
+function countPhraseHits(text: string, phrases: string[], samples: string[]): number {
+  let count = 0
+  for (const phrase of phrases) {
+    let index = text.indexOf(phrase)
+    while (index !== -1) {
+      count++
+      if (samples.length < 8) {
+        const start = Math.max(0, index - 8)
+        samples.push(text.slice(start, index + phrase.length + 8).replace(/\s+/g, ''))
+      }
+      index = text.indexOf(phrase, index + phrase.length)
+    }
+  }
+  return count
+}
+
+function shortFragmentParagraphRatio(text: string): { count: number; ratio: number } {
+  const paragraphs = text.split(/\n+/).map(segment => segment.trim()).filter(Boolean)
+  if (paragraphs.length === 0) return { count: 0, ratio: 0 }
+
+  let short = 0
+  for (const paragraph of paragraphs) {
+    const cjkLen = countMatches(paragraph, /[㐀-鿿]/g)
+    const sentenceCount = paragraph.split(/[。！？]/).filter(segment => segment.trim()).length
+    if (cjkLen > 0 && cjkLen <= 8 && sentenceCount <= 1) short++
+  }
+
+  return { count: short, ratio: short / paragraphs.length }
 }
 
 function looksLikeChapterDraft(content: string): boolean {

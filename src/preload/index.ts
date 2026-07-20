@@ -2,11 +2,21 @@ import { contextBridge, ipcRenderer } from 'electron'
 import type { ElectronAPI } from './types'
 
 const api: ElectronAPI = {
+  lifecycle: {
+    onBeforeClose: (callback) => {
+      const handler = () => callback()
+      ipcRenderer.on('app:beforeClose', handler)
+      return () => ipcRenderer.removeListener('app:beforeClose', handler)
+    },
+    completeClose: (saved) => ipcRenderer.invoke('app:completeClose', saved),
+  },
   file: {
-    createProject: (name, rootPath, agentGroupId) => ipcRenderer.invoke('file:createProject', name, rootPath, agentGroupId),
+    createProject: (name, rootPath) => ipcRenderer.invoke('file:createProject', name, rootPath),
     listProjects: () => ipcRenderer.invoke('file:listProjects'),
     getProject: (id) => ipcRenderer.invoke('file:getProject', id),
     deleteProject: (id) => ipcRenderer.invoke('file:deleteProject', id),
+    getChapterWordTarget: (projectId) => ipcRenderer.invoke('file:getChapterWordTarget', projectId),
+    setChapterWordTarget: (projectId, value) => ipcRenderer.invoke('file:setChapterWordTarget', projectId, value),
     listChapters: (projectId) => ipcRenderer.invoke('file:listChapters', projectId),
     createChapter: (params) => ipcRenderer.invoke('file:createChapter', params),
     saveChapter: (id, content) => ipcRenderer.invoke('file:saveChapter', id, content),
@@ -33,8 +43,10 @@ const api: ElectronAPI = {
     createConversation: (projectId, chapterId, title, providerConfigId) =>
       ipcRenderer.invoke('ai:createConversation', projectId, chapterId, title, providerConfigId),
     listConversations: (projectId) => ipcRenderer.invoke('ai:listConversations', projectId),
+    deleteConversation: (conversationId) => ipcRenderer.invoke('ai:deleteConversation', conversationId),
     getMessages: (conversationId) => ipcRenderer.invoke('ai:getMessages', conversationId),
     sendMessage: (params) => ipcRenderer.invoke('ai:sendMessage', params),
+    abortStream: (conversationId) => ipcRenderer.invoke('ai:abortStream', conversationId),
     sendMessageSync: (params) => ipcRenderer.invoke('ai:sendMessageSync', params),
     planChapterEdit: (params) => ipcRenderer.invoke('ai:planChapterEdit', params),
     onToken: (callback) => {
@@ -42,14 +54,28 @@ const api: ElectronAPI = {
       ipcRenderer.on('ai:token', handler)
       return () => ipcRenderer.removeListener('ai:token', handler)
     },
+    onThinking: (callback) => {
+      const handler = (_event: any, data: { conversationId: string; thinking: string }) => callback(data)
+      ipcRenderer.on('ai:thinking', handler)
+      return () => ipcRenderer.removeListener('ai:thinking', handler)
+    },
   },
   appAgent: {
     sendMessage: (params) => ipcRenderer.invoke('appAgent:sendMessage', params),
+    abortMessage: (conversationId) => ipcRenderer.invoke('appAgent:abortMessage', conversationId),
     onAction: (callback) => {
       const handler = (_event: any, data: any) => callback(data)
       ipcRenderer.on('appAgent:action', handler)
       return () => ipcRenderer.removeListener('appAgent:action', handler)
     },
+  },
+  skill: {
+    list: () => ipcRenderer.invoke('skill:list'),
+    import: (sourcePath) => ipcRenderer.invoke('skill:import', sourcePath),
+    rename: (id, name) => ipcRenderer.invoke('skill:rename', id, name),
+    delete: (id) => ipcRenderer.invoke('skill:delete', id),
+    getBindings: () => ipcRenderer.invoke('skill:getBindings'),
+    setBindings: (bindings) => ipcRenderer.invoke('skill:setBindings', bindings),
   },
   settings: {
     getAppearance: () => ipcRenderer.invoke('settings:getAppearance'),
@@ -73,26 +99,9 @@ const api: ElectronAPI = {
     delete: (id) => ipcRenderer.invoke('outline:delete', id),
   },
   agent: {
-    list: () => ipcRenderer.invoke('agent:list'),
-    get: (id) => ipcRenderer.invoke('agent:get', id),
-    create: (params) => ipcRenderer.invoke('agent:create', params),
-    update: (id, updates) => ipcRenderer.invoke('agent:update', id, updates),
-    delete: (id) => ipcRenderer.invoke('agent:delete', id),
-    listCategories: () => ipcRenderer.invoke('agent:listCategories'),
-    createCategory: (name) => ipcRenderer.invoke('agent:createCategory', name),
-    updateCategory: (id, name) => ipcRenderer.invoke('agent:updateCategory', id, name),
-    deleteCategory: (id) => ipcRenderer.invoke('agent:deleteCategory', id),
-    listGroups: (projectId) => ipcRenderer.invoke('agent:listGroups', projectId),
-    listAllGroups: () => ipcRenderer.invoke('agent:listAllGroups'),
-    createGroup: (name, projectId, collaborationMode) => ipcRenderer.invoke('agent:createGroup', name, projectId, collaborationMode),
-    updateGroup: (id, updates) => ipcRenderer.invoke('agent:updateGroup', id, updates),
-    getGroup: (id) => ipcRenderer.invoke('agent:getGroup', id),
-    getGroupMembers: (groupId) => ipcRenderer.invoke('agent:getGroupMembers', groupId),
-    addGroupMember: (groupId, agentId, turnOrder, canInitiate, isModerator) => ipcRenderer.invoke('agent:addGroupMember', groupId, agentId, turnOrder, canInitiate, isModerator),
-    removeGroupMember: (groupId, agentId) => ipcRenderer.invoke('agent:removeGroupMember', groupId, agentId),
-    deleteGroup: (groupId) => ipcRenderer.invoke('agent:deleteGroup', groupId),
-    bindProjectGroup: (projectId, groupId) => ipcRenderer.invoke('agent:bindProjectGroup', projectId, groupId),
-    runWorkflow: (groupId, projectId, inputContext) => ipcRenderer.invoke('agent:runWorkflow', groupId, projectId, inputContext),
+    getWritingTeam: () => ipcRenderer.invoke('agent:getWritingTeam'),
+    updateWritingAgent: (role, updates) => ipcRenderer.invoke('agent:updateWritingAgent', role, updates),
+    runWritingWorkflow: (projectId, inputContext, chapterId) => ipcRenderer.invoke('agent:runWritingWorkflow', projectId, inputContext, chapterId),
     stopWorkflow: () => ipcRenderer.invoke('agent:stopWorkflow'),
     sendWorkflowMessage: (message) => ipcRenderer.invoke('agent:sendWorkflowMessage', message),
     onWorkflowEvent: (callback) => {

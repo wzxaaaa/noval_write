@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react'
 import { useAIStore } from '../../stores/ai.store'
 import type { ProviderConfig as ProviderConfigData } from '../../../preload/types'
+import { ModalDialog } from '../common/ModalDialog'
 
 interface ProviderConfigProps {
   onClose: () => void
@@ -20,20 +21,14 @@ interface ProviderFormState {
 
 export function ProviderConfig({ onClose }: ProviderConfigProps) {
   return (
-    <div className="modal-overlay">
-      <div className="modal provider-config-modal">
-        <div className="modal-header">
-          <h2>AI 提供商配置</h2>
-          <button onClick={onClose}>✕</button>
-        </div>
-        <ProviderConfigContent />
-      </div>
-    </div>
+    <ModalDialog title="AI 提供商配置" onClose={onClose} className="provider-config-modal">
+      <ProviderConfigContent />
+    </ModalDialog>
   )
 }
 
 export function ProviderConfigContent() {
-  const { providers, setProviders, addProvider, updateProvider, removeProvider } = useAIStore()
+  const { providers, setProviders, addProvider, updateProvider } = useAIStore()
   const [editingProvider, setEditingProvider] = useState<string | null>(null)
   const [form, setForm] = useState<ProviderFormState>({
     name: '',
@@ -45,6 +40,7 @@ export function ProviderConfigContent() {
     is_default: false
   })
   const [testResult, setTestResult] = useState<string | null>(null)
+  const [parameterCopied, setParameterCopied] = useState(false)
 
   useEffect(() => {
     window.electronAPI.ai.listProviders().then(setProviders)
@@ -65,7 +61,15 @@ export function ProviderConfigContent() {
 
     if (editingProvider) {
       await window.electronAPI.ai.updateProvider(editingProvider, params)
-      updateProvider(editingProvider, { ...params, parameters: JSON.stringify(params.parameters), is_default: params.is_default ? 1 : 0 } as any)
+      updateProvider(editingProvider, {
+        name: params.name,
+        provider: params.provider,
+        api_key: params.api_key,
+        base_url: params.base_url ?? null,
+        model: params.model,
+        parameters: JSON.stringify(params.parameters),
+        is_default: params.is_default ? 1 : 0
+      })
     } else {
       const created = await window.electronAPI.ai.createProvider(params)
       addProvider(created)
@@ -84,6 +88,16 @@ export function ProviderConfigContent() {
     setEditingProvider(null)
     setForm({ name: '', provider: 'anthropic', api_key: '', base_url: '', model: '', parameters: '{}', is_default: false })
     setTestResult(null)
+  }
+
+  const copyParameterExample = async () => {
+    try {
+      await navigator.clipboard.writeText(parameterPlaceholder)
+      setParameterCopied(true)
+      window.setTimeout(() => setParameterCopied(false), 1600)
+    } catch {
+      window.alert('复制失败，请手动选择示例内容复制。')
+    }
   }
 
   const modelOptions: Record<string, string[]> = {
@@ -132,7 +146,7 @@ export function ProviderConfigContent() {
                   <button onClick={() => handleTest(p.id)}>测试</button>
                   <button onClick={async () => {
                     await window.electronAPI.ai.deleteProvider(p.id)
-                    removeProvider(p.id)
+                    setProviders(await window.electronAPI.ai.listProviders())
                   }}>删除</button>
                 </div>
               </div>
@@ -179,15 +193,31 @@ export function ProviderConfigContent() {
               <input value={form.model} onChange={e => setForm({ ...form, model: e.target.value })} placeholder="或输入自定义模型名" />
             </label>
 
-            <label>
-              参数 (JSON)
+            <div className="form-field parameter-field">
+              <div className="field-label-row">
+                <label className="field-label-text" htmlFor="provider-parameters">参数 (JSON)</label>
+                <span className="json-helper">
+                  <button type="button" className="json-helper-trigger" aria-label="查看参数 JSON 示例">
+                    {'{}'}
+                  </button>
+                  <div className="json-helper-popover" role="tooltip">
+                    <span className="json-helper-title">参数示例</span>
+                    <span className="json-helper-copy-note">可直接复制到下方输入框后按需调整。</span>
+                    <pre>{parameterPlaceholder}</pre>
+                    <button type="button" onClick={() => void copyParameterExample()}>
+                      {parameterCopied ? '已复制' : '复制示例'}
+                    </button>
+                  </div>
+                </span>
+              </div>
               <textarea
+                id="provider-parameters"
                 value={form.parameters}
                 onChange={e => setForm({ ...form, parameters: e.target.value })}
                 placeholder={parameterPlaceholder}
                 rows={form.provider === 'openai-compat' ? 7 : 5}
               />
-            </label>
+            </div>
 
             <label className="checkbox-label">
               <input type="checkbox" checked={form.is_default} onChange={e => setForm({ ...form, is_default: e.target.checked })} />

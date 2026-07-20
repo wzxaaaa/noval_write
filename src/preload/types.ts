@@ -1,6 +1,8 @@
 import type { PlannedChapterEditRequest, PlannedChapterEditResult } from '../shared/novelEditPlan'
 import type { AppAgentActionEvent, AppAgentMessageParams, AppAgentMessageResult, AppUIEffect } from '../shared/appActions'
 import type { AppearanceSettings } from '../shared/appearance'
+import type { SkillBindings, SkillRecord } from '../shared/skills'
+import type { WritingAgentRole } from '../shared/writingAgents'
 
 export interface ChapterData {
   id: string
@@ -31,7 +33,6 @@ export interface ProjectData {
   root_path: string
   created_at: string
   updated_at: string
-  default_agent_group_id: string | null
   metadata: string
 }
 
@@ -40,7 +41,7 @@ export interface ProjectSummary {
   name: string
   root_path: string
   updated_at: string
-  default_agent_group_id: string | null
+  target_chapter_words?: number | null
 }
 
 export interface ProviderConfig {
@@ -69,6 +70,8 @@ export interface AIStreamParams {
   conversationId: string
   providerConfigId: string
   messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>
+  /** The raw user turn for this request. Kept separate from sanitized history for idempotent persistence. */
+  userMessage?: string
   aiParams?: Record<string, unknown>
 }
 
@@ -100,23 +103,12 @@ export interface AgentConfig {
   role: string
   system_prompt: string
   model: string
+  provider_config_id: string | null
+  pipeline_role: WritingAgentRole | null
+  is_system: number
   tools: string
   parameters: string
   category_id: string | null
-  created_at: string
-}
-
-export interface AgentCategory {
-  id: string
-  name: string
-  created_at: string
-}
-
-export interface AgentGroup {
-  id: string
-  name: string
-  project_id: string | null
-  collaboration_mode: 'round_robin' | 'moderator'
   created_at: string
 }
 
@@ -127,17 +119,6 @@ export interface ExportProgressData {
   percent: number
   status: 'started' | 'writing' | 'done' | 'error'
   message?: string
-}
-
-export interface AgentGroupMember {
-  group_id: string
-  agent_id: string
-  turn_order: number
-  can_initiate: number
-  is_moderator: number
-  routing_rules: string
-  name: string
-  role: string
 }
 
 export type OutlineType = 'outline' | 'detailed'
@@ -173,11 +154,17 @@ export interface MessageData {
 }
 
 export interface ElectronAPI {
+  lifecycle: {
+    onBeforeClose(callback: () => void): () => void
+    completeClose(saved: boolean): Promise<void>
+  }
   file: {
-    createProject(name: string, rootPath: string, agentGroupId?: string | null): Promise<ProjectData>
+    createProject(name: string, rootPath: string): Promise<ProjectData>
     listProjects(): Promise<ProjectSummary[]>
     getProject(id: string): Promise<ProjectData | undefined>
     deleteProject(id: string): Promise<void>
+    getChapterWordTarget(projectId: string): Promise<number | null>
+    setChapterWordTarget(projectId: string, value: number | null): Promise<number | null>
     listChapters(projectId: string): Promise<ChapterData[]>
     createChapter(params: { projectId: string; parentId?: string | null; title: string; content?: string }): Promise<ChapterData>
     saveChapter(id: string, content: string): Promise<ChapterData | undefined>
@@ -199,15 +186,27 @@ export interface ElectronAPI {
     testConnection(configId: string): Promise<{ ok: boolean; error?: string }>
     createConversation(projectId: string, chapterId?: string, title?: string, providerConfigId?: string): Promise<ConversationData>
     listConversations(projectId: string): Promise<ConversationData[]>
+    deleteConversation(conversationId: string): Promise<void>
     getMessages(conversationId: string): Promise<MessageData[]>
-    sendMessage(params: AIStreamParams): Promise<{ content?: string; conversationId: string; error?: string }>
+    sendMessage(params: AIStreamParams): Promise<{ content?: string; conversationId: string; error?: string; aborted?: boolean }>
+    abortStream(conversationId: string): Promise<void>
     sendMessageSync(params: { providerConfigId: string; messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>; aiParams?: Record<string, unknown> }): Promise<{ content: string; usage: { inputTokens: number; outputTokens: number } }>
     planChapterEdit(params: PlannedChapterEditRequest): Promise<PlannedChapterEditResult>
     onToken(callback: (data: { conversationId: string; token: string }) => void): () => void
+    onThinking(callback: (data: { conversationId: string; thinking: string }) => void): () => void
   }
   appAgent: {
     sendMessage(params: AppAgentMessageParams): Promise<AppAgentMessageResult>
+    abortMessage(conversationId: string): Promise<void>
     onAction(callback: (event: AppAgentActionEvent) => void): () => void
+  }
+  skill: {
+    list(): Promise<SkillRecord[]>
+    import(sourcePath: string): Promise<SkillRecord>
+    rename(id: string, name: string): Promise<SkillRecord | undefined>
+    delete(id: string): Promise<void>
+    getBindings(): Promise<SkillBindings>
+    setBindings(bindings: SkillBindings): Promise<SkillBindings>
   }
   settings: {
     getAppearance(): Promise<AppearanceSettings>
@@ -231,26 +230,9 @@ export interface ElectronAPI {
     delete(id: string): Promise<void>
   }
   agent: {
-    list(): Promise<AgentConfig[]>
-    get(id: string): Promise<AgentConfig | undefined>
-    create(params: { name: string; description?: string; role: string; system_prompt: string; model: string; tools?: string[]; parameters?: Record<string, unknown>; category_id?: string | null }): Promise<AgentConfig>
-    update(id: string, updates: Partial<{ name: string; description?: string; role: string; system_prompt: string; model: string; tools?: string[]; parameters?: Record<string, unknown>; category_id?: string | null }>): Promise<void>
-    delete(id: string): Promise<void>
-    listCategories(): Promise<AgentCategory[]>
-    createCategory(name: string): Promise<AgentCategory>
-    updateCategory(id: string, name: string): Promise<void>
-    deleteCategory(id: string): Promise<void>
-    listGroups(projectId: string): Promise<AgentGroup[]>
-    listAllGroups(): Promise<AgentGroup[]>
-    createGroup(name: string, projectId?: string | null, collaborationMode?: string): Promise<AgentGroup>
-    updateGroup(id: string, updates: { name?: string; collaboration_mode?: string }): Promise<void>
-    getGroup(id: string): Promise<AgentGroup | undefined>
-    getGroupMembers(groupId: string): Promise<AgentGroupMember[]>
-    addGroupMember(groupId: string, agentId: string, turnOrder: number, canInitiate?: boolean, isModerator?: boolean): Promise<void>
-    removeGroupMember(groupId: string, agentId: string): Promise<void>
-    deleteGroup(groupId: string): Promise<void>
-    bindProjectGroup(projectId: string, groupId: string | null): Promise<void>
-    runWorkflow(groupId: string, projectId: string, inputContext: string): Promise<{ ok: boolean; message?: string }>
+    getWritingTeam(): Promise<AgentConfig[]>
+    updateWritingAgent(role: WritingAgentRole, updates: { provider_config_id?: string | null; system_prompt?: string; parameters?: Record<string, unknown> }): Promise<AgentConfig>
+    runWritingWorkflow(projectId: string, inputContext: string, chapterId?: string | null): Promise<{ ok: boolean; message?: string }>
     stopWorkflow(): Promise<{ ok: boolean; message?: string }>
     sendWorkflowMessage(message: string): Promise<{ ok: boolean; message?: string }>
     onWorkflowEvent(callback: (event: WorkflowEvent) => void): () => void
@@ -260,12 +242,14 @@ export interface ElectronAPI {
 }
 
 export interface ChapterUpdateEvent {
+  projectId?: string
+  runId?: number
   chapterId: string
   oldContent: string
   newContent: string
 }
 
-export type WorkflowEvent =
+export type WorkflowEvent = (
   | { type: 'agentStart'; agentId: string; agentName: string }
   | { type: 'agentToken'; agentId: string; token: string }
   | { type: 'agentThinking'; agentId: string; thinking: string }
@@ -273,3 +257,4 @@ export type WorkflowEvent =
   | { type: 'roundComplete'; round: number }
   | { type: 'workflowComplete'; summary: string }
   | { type: 'error'; message: string }
+) & { projectId?: string; runId?: number }

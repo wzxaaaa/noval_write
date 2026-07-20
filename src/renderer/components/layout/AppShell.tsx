@@ -5,10 +5,11 @@ interface AppShellProps {
   sidebar: React.ReactNode
   main: React.ReactNode
   panel: React.ReactNode | null
+  panelVisible?: boolean
   statusBar: React.ReactNode
 }
 
-export function AppShell({ sidebar, main, panel, statusBar }: AppShellProps) {
+export function AppShell({ sidebar, main, panel, panelVisible = true, statusBar }: AppShellProps) {
   const { theme, sidebarWidth, panelWidth, focusMode } = useUIStore()
 
   return (
@@ -21,7 +22,7 @@ export function AppShell({ sidebar, main, panel, statusBar }: AppShellProps) {
           {main}
         </div>
         {panel && (
-          <div className="app-panel" style={{ width: panelWidth }}>
+          <div className="app-panel" style={{ width: panelVisible ? panelWidth : 0, display: panelVisible ? undefined : 'none' }}>
             {panel}
           </div>
         )}

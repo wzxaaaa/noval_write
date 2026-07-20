@@ -14,18 +14,24 @@ export interface AgentDraft {
   content: string
 }
 
-let pendingChapterProposal: AgentChapterProposalDetail | null = null
+// 按章节挂起：写作团队/小漫可能针对"非当前章节"发起修改，等用户切到
+// 对应章节时再弹确认 diff。单槽会被后续提案覆盖，所以用 Map。
+const pendingChapterProposals = new Map<string, AgentChapterProposalDetail>()
 
 export function emitAgentChapterProposal(detail: AgentChapterProposalDetail): void {
-  pendingChapterProposal = detail
+  pendingChapterProposals.set(detail.chapterId, detail)
   window.dispatchEvent(new CustomEvent<AgentChapterProposalDetail>(AGENT_CHAPTER_PROPOSAL_EVENT, { detail }))
 }
 
-export function takePendingAgentChapterProposal(chapterId: string | null): AgentChapterProposalDetail | null {
-  if (!chapterId || pendingChapterProposal?.chapterId !== chapterId) return null
+/** 只挂起、不广播：目标章节不在前台时留给章节加载流程消费。 */
+export function storePendingAgentChapterProposal(detail: AgentChapterProposalDetail): void {
+  pendingChapterProposals.set(detail.chapterId, detail)
+}
 
-  const proposal = pendingChapterProposal
-  pendingChapterProposal = null
+export function takePendingAgentChapterProposal(chapterId: string | null): AgentChapterProposalDetail | null {
+  if (!chapterId) return null
+  const proposal = pendingChapterProposals.get(chapterId) ?? null
+  if (proposal) pendingChapterProposals.delete(chapterId)
   return proposal
 }
 

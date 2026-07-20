@@ -17,7 +17,7 @@ interface UIState {
 }
 
 export const useUIStore = create<UIState>((set) => ({
-  theme: 'dark',
+  theme: DEFAULT_APPEARANCE_SETTINGS.theme,
   appearance: DEFAULT_APPEARANCE_SETTINGS,
   sidebarWidth: 260,
   panelWidth: 380,

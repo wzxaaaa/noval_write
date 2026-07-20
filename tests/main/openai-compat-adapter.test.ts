@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import {
+  extractOpenAIMessageText,
+  extractOpenAIStreamDeltaText
+} from '../../src/main/services/ai-adapter/openai.adapter'
+import {
   isKimiCompatibleConfig,
   normalizeKimiCompletionParams
 } from '../../src/main/services/ai-adapter/openai-compat.adapter'
@@ -23,5 +27,45 @@ describe('openai compatible adapter provider quirks', () => {
       maxTokens: 8192
     })
     expect(normalizeKimiCompletionParams({ temperature: 1, topP: 0.9 }, 'kimi-k2.5-preview')).toEqual({})
+  })
+
+  it('extracts OpenAI-compatible content arrays and stream deltas', () => {
+    expect(extractOpenAIMessageText({
+      content: [
+        { type: 'text', text: '第一段' },
+        { type: 'text', text: '第二段' }
+      ]
+    })).toBe('第一段第二段')
+
+    expect(extractOpenAIStreamDeltaText({
+      content: [{ type: 'text', text: '增量' }]
+    })).toBe('增量')
+  })
+
+  it('preserves OpenAI-compatible tool calls when content is empty', () => {
+    const text = extractOpenAIMessageText({
+      content: null,
+      tool_calls: [
+        {
+          type: 'function',
+          function: {
+            name: 'read_outline',
+            arguments: '{"type":"detailed"}'
+          }
+        }
+      ]
+    })
+
+    expect(JSON.parse(text)).toEqual({
+      tool_calls: [
+        {
+          type: 'function',
+          function: {
+            name: 'read_outline',
+            arguments: '{"type":"detailed"}'
+          }
+        }
+      ]
+    })
   })
 })

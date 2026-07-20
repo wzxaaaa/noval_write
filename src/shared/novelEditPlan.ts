@@ -168,14 +168,29 @@ export function normalizePlan(rawPlan: NovelEditPlan): NovelEditPlan {
 }
 
 export function cleanDraftText(input: string): string {
-  return input
-    .replace(/\r\n/g, '\n')
-    .replace(/\[WORKFLOW_COMPLETE\]/g, '')
-    .replace(/\[\s*TOOL\s*:[\s\S]*?\[\s*\/\s*TOOL\s*\]/gi, '')
-    .replace(/```(?:markdown|md|text|html)?\n([\s\S]*?)```/gi, '$1')
-    .replace(/^\s*\*\*(正文|正文定稿|最终正文|小说正文|章节正文|成稿|正文稿|最终稿)[:：]?\s*\*\*\s*$/gim, '')
-    .replace(/^\s*(正文|正文定稿|最终正文|小说正文|章节正文|成稿|正文稿|最终稿)[:：]\s*$/gim, '')
-    .trim()
+  return normalizeDialogueQuotes(
+    input
+      .replace(/\r\n/g, '\n')
+      .replace(/\[WORKFLOW_COMPLETE\]/g, '')
+      .replace(/\[\s*TOOL\s*:[\s\S]*?\[\s*\/\s*TOOL\s*\]/gi, '')
+      .replace(/```(?:markdown|md|text|html)?\n([\s\S]*?)```/gi, '$1')
+      .replace(/^\s*\*\*(正文|正文定稿|最终正文|小说正文|章节正文|成稿|正文稿|最终稿)[:：]?\s*\*\*\s*$/gim, '')
+      .replace(/^\s*(正文|正文定稿|最终正文|小说正文|章节正文|成稿|正文稿|最终稿)[:：]\s*$/gim, '')
+      .trim()
+  )
+}
+
+/**
+ * 对白引号归一：直角引号「」『』统一转成中文双/单引号。
+ * Claude 系模型交付正文时倾向输出「」，靠提示词约束不完全可靠，
+ * 入库前做确定性转换兜底，保证全书引号风格一致。
+ */
+export function normalizeDialogueQuotes(text: string): string {
+  return text
+    .replace(/「/g, '“')
+    .replace(/」/g, '”')
+    .replace(/『/g, '‘')
+    .replace(/』/g, '’')
 }
 
 export function fallbackNovelEditPlan(newText: string, reason = '未能获得可靠定位，默认追加到章尾'): NovelEditPlan {

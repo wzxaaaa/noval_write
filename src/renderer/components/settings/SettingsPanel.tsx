@@ -1,8 +1,10 @@
 import React from 'react'
 import { ProviderConfigContent } from '../ai/ProviderConfig'
 import { AppearanceSettings } from './AppearanceSettings'
+import { SkillSettings } from './SkillSettings'
+import { ModalDialog } from '../common/ModalDialog'
 
-export type SettingsTab = 'api' | 'appearance'
+export type SettingsTab = 'api' | 'appearance' | 'skills'
 
 interface SettingsPanelProps {
   mode: 'modal' | 'panel'
@@ -12,35 +14,59 @@ interface SettingsPanelProps {
 
 export function SettingsPanel({ mode, initialTab = 'appearance', onClose }: SettingsPanelProps) {
   const [activeTab, setActiveTab] = React.useState<SettingsTab>(initialTab)
-  const content = (
-    <div className={`settings-shell settings-shell-${mode}`}>
-      <div className="modal-header settings-header">
-        <h2>设置</h2>
-        <button onClick={onClose}>✕</button>
-      </div>
-      <div className="settings-tabs">
-        <button className={activeTab === 'appearance' ? 'active' : ''} onClick={() => setActiveTab('appearance')}>
+  const settingsBody = (
+    <>
+      <div className="settings-tabs" aria-label="设置分类">
+        <button
+          type="button"
+          aria-pressed={activeTab === 'appearance'}
+          className={activeTab === 'appearance' ? 'active' : ''}
+          onClick={() => setActiveTab('appearance')}
+        >
           外观
         </button>
-        <button className={activeTab === 'api' ? 'active' : ''} onClick={() => setActiveTab('api')}>
+        <button
+          type="button"
+          aria-pressed={activeTab === 'api'}
+          className={activeTab === 'api' ? 'active' : ''}
+          onClick={() => setActiveTab('api')}
+        >
           模型 / API
+        </button>
+        <button
+          type="button"
+          aria-pressed={activeTab === 'skills'}
+          className={activeTab === 'skills' ? 'active' : ''}
+          onClick={() => setActiveTab('skills')}
+        >
+          技能
         </button>
       </div>
       <div className="settings-content">
-        {activeTab === 'appearance' ? <AppearanceSettings /> : <ProviderConfigContent />}
+        {activeTab === 'appearance' && <AppearanceSettings />}
+        {activeTab === 'api' && <ProviderConfigContent />}
+        {activeTab === 'skills' && <SkillSettings />}
       </div>
-    </div>
+    </>
   )
 
   if (mode === 'modal') {
     return (
-      <div className="modal-overlay">
-        <div className="modal settings-modal">
-          {content}
+      <ModalDialog title="设置" onClose={onClose} className="settings-modal">
+        <div className="settings-shell settings-shell-modal">
+          {settingsBody}
         </div>
-      </div>
+      </ModalDialog>
     )
   }
 
-  return content
+  return (
+    <div className="settings-shell settings-shell-panel">
+      <div className="modal-header settings-header">
+        <h2>设置</h2>
+        <button type="button" onClick={onClose} aria-label="关闭设置">✕</button>
+      </div>
+      {settingsBody}
+    </div>
+  )
 }

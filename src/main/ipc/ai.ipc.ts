@@ -3,6 +3,13 @@ import { providerConfigRepo, type ProviderConfigCreate } from '../db/repositorie
 import { conversationRepo } from '../db/repositories/conversation.repo'
 import { createAdapter } from '../services/ai-adapter/adapter-factory'
 import type { AIChatMessage } from '../services/ai-adapter/types'
+import { normalizeAssistantContent, sanitizeChatMessages } from '../../shared/chatMessages'
+import { assertTrustedIpcSender } from '../utils/approved-paths'
+import {
+  abortStreamController,
+  releaseStreamController,
+  replaceStreamController
+} from './stream-controller-registry'
 import {
   applyNovelEditPlan,
   buildNumberedChapterText,
@@ -16,29 +23,38 @@ import {
   type PlannedChapterEditRequest
 } from '../../shared/novelEditPlan'
 
+// 活跃流的 AbortController，按 conversationId 索引
+const activeStreams = new Map<string, AbortController>()
+
 export function registerAIHandlers(): void {
   // Provider management
-  ipcMain.handle('ai:listProviders', async () => {
+  ipcMain.handle('ai:listProviders', async (event) => {
+    assertTrustedIpcSender(event)
     return providerConfigRepo.list()
   })
 
-  ipcMain.handle('ai:getProvider', async (_event, id: string) => {
+  ipcMain.handle('ai:getProvider', async (event, id: string) => {
+    assertTrustedIpcSender(event)
     return providerConfigRepo.getById(id)
   })
 
-  ipcMain.handle('ai:createProvider', async (_event, params: ProviderConfigCreate) => {
+  ipcMain.handle('ai:createProvider', async (event, params: ProviderConfigCreate) => {
+    assertTrustedIpcSender(event)
     return providerConfigRepo.create(params)
   })
 
-  ipcMain.handle('ai:updateProvider', async (_event, id: string, updates: Partial<ProviderConfigCreate>) => {
+  ipcMain.handle('ai:updateProvider', async (event, id: string, updates: Partial<ProviderConfigCreate>) => {
+    assertTrustedIpcSender(event)
     providerConfigRepo.update(id, updates)
   })
 
-  ipcMain.handle('ai:deleteProvider', async (_event, id: string) => {
+  ipcMain.handle('ai:deleteProvider', async (event, id: string) => {
+    assertTrustedIpcSender(event)
     providerConfigRepo.delete(id)
   })
 
-  ipcMain.handle('ai:testConnection', async (_event, configId: string) => {
+  ipcMain.handle('ai:testConnection', async (event, configId: string) => {
+    assertTrustedIpcSender(event)
     const config = providerConfigRepo.getById(configId)
     if (!config) return { ok: false, error: '配置不存在' }
     const adapter = createAdapter(config)
@@ -46,64 +62,120 @@ export function registerAIHandlers(): void {
   })
 
   // Conversation management
-  ipcMain.handle('ai:createConversation', async (_event, projectId: string, chapterId?: string, title?: string, providerConfigId?: string) => {
+  ipcMain.handle('ai:createConversation', async (event, projectId: string, chapterId?: string, title?: string, providerConfigId?: string) => {
+    assertTrustedIpcSender(event)
     return conversationRepo.create(projectId, chapterId, title, providerConfigId)
   })
 
-  ipcMain.handle('ai:listConversations', async (_event, projectId: string) => {
+  ipcMain.handle('ai:listConversations', async (event, projectId: string) => {
+    assertTrustedIpcSender(event)
     return conversationRepo.listByProject(projectId)
   })
 
-  ipcMain.handle('ai:getMessages', async (_event, conversationId: string) => {
+  ipcMain.handle('ai:getMessages', async (event, conversationId: string) => {
+    assertTrustedIpcSender(event)
     return conversationRepo.getMessages(conversationId)
   })
 
+  ipcMain.handle('ai:deleteConversation', async (event, conversationId: string) => {
+    assertTrustedIpcSender(event)
+    conversationRepo.delete(conversationId)
+  })
+
   // Streaming AI chat
+  ipcMain.handle('ai:abortStream', async (event, conversationId: string) => {
+    assertTrustedIpcSender(event)
+    abortStreamController(activeStreams, conversationId)
+  })
+
   ipcMain.handle('ai:sendMessage', async (event, params: {
     conversationId: string
     providerConfigId: string
     messages: AIChatMessage[]
+    userMessage?: string
     aiParams?: Record<string, unknown>
   }) => {
+    assertTrustedIpcSender(event)
     const config = providerConfigRepo.getById(params.providerConfigId)
     if (!config) throw new Error('AI 配置不存在')
 
+    // 如果该对话已有活跃流，先终止
+    const abortController = replaceStreamController(activeStreams, params.conversationId)
+
     const adapter = createAdapter(config)
-    const fullMessages: AIChatMessage[] = [...params.messages]
+    // 清洗历史：丢空消息、合并连续同角色，修复此前可能存进库的脏数据。
+    const fullMessages: AIChatMessage[] = sanitizeChatMessages(params.messages)
     const latestMessage = fullMessages[fullMessages.length - 1]
-    if (latestMessage?.role === 'user') {
-      conversationRepo.addMessage(params.conversationId, 'user', latestMessage.content)
+    const userMessage = typeof params.userMessage === 'string' && params.userMessage.trim()
+      ? params.userMessage
+      : latestMessage?.role === 'user' ? latestMessage.content : null
+    if (userMessage) {
+      conversationRepo.addUserMessageIfNeeded(params.conversationId, userMessage)
     }
 
     let fullText = ''
+    let fullThinking = ''
     try {
       await adapter.chatStream(fullMessages, {
         onToken: (token) => {
           fullText += token
-          // Send token to renderer via event
-          event.sender.send('ai:token', { conversationId: params.conversationId, token })
+          if (activeStreams.get(params.conversationId) === abortController) {
+            event.sender.send('ai:token', { conversationId: params.conversationId, token })
+          }
         },
-        onThinking: () => {},
+        onThinking: (thinking) => {
+          fullThinking += thinking
+          if (activeStreams.get(params.conversationId) === abortController) {
+            event.sender.send('ai:thinking', { conversationId: params.conversationId, thinking })
+          }
+        },
         onComplete: (content) => {
-          conversationRepo.addMessage(params.conversationId, 'assistant', content)
+          if (activeStreams.get(params.conversationId) !== abortController) return
+          // 空回复不能落库：一旦写进历史，之后每次请求都会带着它触发 400。
+          const safeContent = normalizeAssistantContent(content) ?? normalizeAssistantContent(fullText)
+          if (!safeContent) return
+          conversationRepo.addMessage(
+            params.conversationId,
+            'assistant',
+            safeContent,
+            undefined,
+            fullThinking ? { thinking: fullThinking } : {}
+          )
         },
         onError: (err) => {
           throw err
         }
-      }, params.aiParams as any)
+      }, { ...params.aiParams as any, signal: abortController.signal })
 
       return { content: fullText, conversationId: params.conversationId }
     } catch (err) {
-      return { conversationId: params.conversationId, error: (err as Error).message }
+      const isAbort = (err as Error).name === 'AbortError' || abortController.signal.aborted
+      // 被终止时，已产出的内容仍然保存
+      if (isAbort && fullText) {
+        if (activeStreams.get(params.conversationId) === abortController) {
+          conversationRepo.addMessage(
+            params.conversationId,
+            'assistant',
+            fullText,
+            undefined,
+            fullThinking ? { thinking: fullThinking } : {}
+          )
+        }
+        return { content: fullText, conversationId: params.conversationId, aborted: true }
+      }
+      return { conversationId: params.conversationId, error: isAbort ? '已终止生成' : (err as Error).message }
+    } finally {
+      releaseStreamController(activeStreams, params.conversationId, abortController)
     }
   })
 
   // Non-streaming AI chat
-  ipcMain.handle('ai:sendMessageSync', async (_event, params: {
+  ipcMain.handle('ai:sendMessageSync', async (event, params: {
     providerConfigId: string
     messages: AIChatMessage[]
     aiParams?: Record<string, unknown>
   }) => {
+    assertTrustedIpcSender(event)
     const config = providerConfigRepo.getById(params.providerConfigId)
     if (!config) throw new Error('AI 配置不存在')
 
@@ -111,7 +183,8 @@ export function registerAIHandlers(): void {
     return adapter.chat(params.messages, params.aiParams as any)
   })
 
-  ipcMain.handle('ai:planChapterEdit', async (_event, params: PlannedChapterEditRequest) => {
+  ipcMain.handle('ai:planChapterEdit', async (event, params: PlannedChapterEditRequest) => {
+    assertTrustedIpcSender(event)
     const config = providerConfigRepo.getById(params.providerConfigId)
     if (!config) throw new Error('AI 配置不存在')
 

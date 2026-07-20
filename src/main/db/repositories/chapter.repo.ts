@@ -118,7 +118,13 @@ export class ChapterRepo {
   }
 
   delete(id: string): void {
-    getDb().prepare('DELETE FROM chapters WHERE id = ?').run(id)
+    const db = getDb()
+    const remove = db.transaction((chapterId: string) => {
+      db.prepare('UPDATE chapters SET parent_id = NULL WHERE parent_id = ?').run(chapterId)
+      db.prepare('UPDATE conversations SET chapter_id = NULL WHERE chapter_id = ?').run(chapterId)
+      db.prepare('DELETE FROM chapters WHERE id = ?').run(chapterId)
+    })
+    remove(id)
   }
 
   addVersion(chapterId: string, content: string, source: string): void {

@@ -7,8 +7,9 @@ import { useProjectStore } from '../../stores/project.store'
 import { useAutoSave } from '../../hooks/useAutoSave'
 import { EditorToolbar } from './EditorToolbar'
 import { computeDiff, diffSummary } from '../../lib/diffEngine'
-import { AGENT_CHAPTER_PROPOSAL_EVENT, takePendingAgentChapterProposal, type AgentChapterProposalDetail } from '../../lib/agentProposal'
+import { AGENT_CHAPTER_PROPOSAL_EVENT, storePendingAgentChapterProposal, takePendingAgentChapterProposal, type AgentChapterProposalDetail } from '../../lib/agentProposal'
 import { useUIStore } from '../../stores/ui.store'
+import { getChapterSaveSnapshot, registerPendingWriteFlusher } from './editorPersistence'
 
 interface NovelEditorProps {
   chapterId: string | null
@@ -18,14 +19,16 @@ interface NovelEditorProps {
 
 export function NovelEditor({ chapterId, projectId, onSelectChapter }: NovelEditorProps) {
   const {
-    content, title, agentProposal,
-    setContent, setTitle, setSelectedText, loadChapter, applyAgentContent, acceptAgentChange, rejectAgentChange, markClean
+    loadedChapterId, content, title, agentProposal, agentProposalConflict,
+    setContent, setTitle, setSelectedText, loadChapter, applyAgentContent, acceptAgentChange, rejectAgentChange
   } = useEditorStore()
   const [agentDiffSummary, setAgentDiffSummary] = React.useState<{ additions: number; deletions: number } | null>(null)
   const [quickChapterTitle, setQuickChapterTitle] = React.useState('第一章')
   const suppressingSync = useRef(false)
-  const previousChapterIdRef = useRef<string | null>(null)
+  const loadSequenceRef = useRef(0)
   const titleSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const pendingTitleRef = useRef<{ chapterId: string; title: string } | null>(null)
+  const contentWrapperRef = useRef<HTMLDivElement>(null)
   const updateChapter = useProjectStore(s => s.updateChapter)
   const addChapter = useProjectStore(s => s.addChapter)
   const fontSize = useUIStore(s => s.fontSize)
@@ -65,19 +68,47 @@ export function NovelEditor({ chapterId, projectId, onSelectChapter }: NovelEdit
     }
   }, [updateChapter])
 
+  const { saveNow, flush: flushContent } = useAutoSave(loadedChapterId, saveChapterContent)
+
   const persistChapterTitle = useCallback(async (id: string, nextTitle: string, normalize = false) => {
     const titleToSave = normalize ? (nextTitle.trim() || '未命名章节') : nextTitle
     if (!titleToSave.trim()) return
 
     await window.electronAPI.file.renameChapter(id, titleToSave)
     updateChapter(id, { title: titleToSave })
-    if (normalize && titleToSave !== nextTitle) {
+    if (
+      normalize &&
+      titleToSave !== nextTitle &&
+      useEditorStore.getState().loadedChapterId === id &&
+      useEditorStore.getState().title === nextTitle
+    ) {
       setTitle(titleToSave)
     }
   }, [setTitle, updateChapter])
 
+  const flushPendingTitle = useCallback(async (normalize = false): Promise<void> => {
+    if (titleSaveTimerRef.current) {
+      clearTimeout(titleSaveTimerRef.current)
+      titleSaveTimerRef.current = null
+    }
+
+    const pending = pendingTitleRef.current
+    if (!pending) return
+    await persistChapterTitle(pending.chapterId, pending.title, normalize)
+    if (pendingTitleRef.current === pending) {
+      pendingTitleRef.current = null
+    }
+  }, [persistChapterTitle])
+
+  useEffect(() => registerPendingWriteFlusher(async () => {
+    await Promise.all([flushContent(), flushPendingTitle(true)])
+  }), [flushContent, flushPendingTitle])
+
   const showAgentProposal = useCallback((newContent: string, oldContent?: string) => {
-    const previousContent = oldContent ?? useEditorStore.getState().content
+    const state = useEditorStore.getState()
+    const currentContent = state.content
+    const conflictsWithCurrent = oldContent !== undefined && currentContent !== oldContent && currentContent !== newContent
+    const previousContent = conflictsWithCurrent ? currentContent : (oldContent ?? currentContent)
     const oldText = stripHtml(previousContent)
     const newText = stripHtml(newContent)
     const diff = computeDiff(oldText, newText)
@@ -85,46 +116,72 @@ export function NovelEditor({ chapterId, projectId, onSelectChapter }: NovelEdit
     if (summary.additions === 0 && summary.deletions === 0) return
 
     setAgentDiffSummary(summary)
-    if (editor) {
+    if (editor && !conflictsWithCurrent) {
       suppressingSync.current = true
       editor.commands.setContent(newContent)
       suppressingSync.current = false
     }
-    applyAgentContent(newContent)
+    applyAgentContent(newContent, previousContent, conflictsWithCurrent)
   }, [editor, applyAgentContent])
 
   useEffect(() => {
-    const previousChapterId = previousChapterIdRef.current
-    if (previousChapterId && previousChapterId !== chapterId) {
+    const sequence = ++loadSequenceRef.current
+    let cancelled = false
+
+    const loadSelectedChapter = async (): Promise<void> => {
       const state = useEditorStore.getState()
-      if (state.isDirty) {
-        void saveChapterContent(previousChapterId, state.content)
+      if (state.loadedChapterId && state.loadedChapterId !== chapterId) {
+        if (state.agentProposal && state.agentProposedContent) {
+          storePendingAgentChapterProposal({
+            chapterId: state.loadedChapterId,
+            html: state.agentProposedContent,
+            oldHtml: state.agentOldContent ?? state.content,
+            sourceName: '待确认正文提案'
+          })
+        }
+
+        const saveSnapshot = getChapterSaveSnapshot(state, chapterId)
+        await Promise.all([
+          saveSnapshot ? saveNow(saveSnapshot.chapterId, saveSnapshot.content) : Promise.resolve(),
+          flushPendingTitle(true)
+        ])
+      }
+
+      if (cancelled || sequence !== loadSequenceRef.current) return
+      if (!chapterId) {
+        useEditorStore.getState().reset()
+        setAgentDiffSummary(null)
+        return
+      }
+
+      const chapters = await window.electronAPI.file.listChapters(projectId)
+      if (cancelled || sequence !== loadSequenceRef.current) return
+      const chapter = chapters.find(c => c.id === chapterId)
+      if (!chapter) return
+
+      loadChapter(chapter.id, chapter.title, chapter.content)
+      setAgentDiffSummary(null)
+      if (editor) {
+        suppressingSync.current = true
+        editor.commands.setContent(chapter.content)
+        suppressingSync.current = false
+      }
+      // 切换章节后把正文滚动区复位到顶部，回到本章开头。
+      requestAnimationFrame(() => contentWrapperRef.current?.scrollTo({ top: 0 }))
+
+      const pendingProposal = takePendingAgentChapterProposal(chapter.id)
+      if (pendingProposal) {
+        showAgentProposal(pendingProposal.html, pendingProposal.oldHtml ?? chapter.content)
       }
     }
-    previousChapterIdRef.current = chapterId
 
-    if (chapterId) {
-      let cancelled = false
-      window.electronAPI.file.listChapters(projectId).then(chapters => {
-        if (cancelled) return
-        const chapter = chapters.find(c => c.id === chapterId)
-        if (chapter) {
-          loadChapter(chapter.title, chapter.content)
-          if (editor) {
-            suppressingSync.current = true
-            editor.commands.setContent(chapter.content)
-            suppressingSync.current = false
-          }
-
-          const pendingProposal = takePendingAgentChapterProposal(chapter.id)
-          if (pendingProposal) {
-            showAgentProposal(pendingProposal.html, pendingProposal.oldHtml ?? chapter.content)
-          }
-        }
-      })
-      return () => { cancelled = true }
-    }
-  }, [chapterId, projectId, editor, loadChapter, saveChapterContent, showAgentProposal])
+    void loadSelectedChapter().catch((err) => {
+      if (!cancelled && sequence === loadSequenceRef.current) {
+        console.error('Chapter load failed:', err)
+      }
+    })
+    return () => { cancelled = true }
+  }, [chapterId, projectId, editor, flushPendingTitle, loadChapter, saveNow, showAgentProposal])
 
   // Sync content changes from store back to editor (e.g. after accept/reject)
   useEffect(() => {
@@ -140,9 +197,18 @@ export function NovelEditor({ chapterId, projectId, onSelectChapter }: NovelEdit
   // Listen for agent chapter updates
   useEffect(() => {
     const unsubscribe = window.electronAPI.agent.onChapterUpdate((event) => {
-      if (event.chapterId === chapterId) {
+      if (event.chapterId === chapterId && useEditorStore.getState().loadedChapterId === event.chapterId) {
         showAgentProposal(event.newContent, event.oldContent)
+        return
       }
+      // 写作团队改写的不是当前章节：库里已经是新稿，不能静默丢事件。
+      // 挂起 diff，等用户切到该章节时再弹确认条（拒绝会恢复旧稿并回存）。
+      storePendingAgentChapterProposal({
+        chapterId: event.chapterId,
+        html: event.newContent,
+        oldHtml: event.oldContent,
+        sourceName: '写作团队改写'
+      })
     })
     return unsubscribe
   }, [chapterId, showAgentProposal])
@@ -150,7 +216,7 @@ export function NovelEditor({ chapterId, projectId, onSelectChapter }: NovelEdit
   useEffect(() => {
     const handleProposal = (event: Event) => {
       const detail = (event as CustomEvent<AgentChapterProposalDetail>).detail
-      if (detail.chapterId === chapterId) {
+      if (detail.chapterId === chapterId && useEditorStore.getState().loadedChapterId === detail.chapterId) {
         takePendingAgentChapterProposal(detail.chapterId)
         showAgentProposal(detail.html, detail.oldHtml)
       }
@@ -164,9 +230,10 @@ export function NovelEditor({ chapterId, projectId, onSelectChapter }: NovelEdit
     const handleChapterUpdated = (event: Event) => {
       const detail = (event as CustomEvent<{ projectId?: string; chapterId?: string; title?: string; content?: string }>).detail
       if (detail.projectId !== projectId || detail.chapterId !== chapterId || !detail.content) return
-      if (useEditorStore.getState().isDirty) return
+      const state = useEditorStore.getState()
+      if (state.loadedChapterId !== detail.chapterId || state.isDirty || state.agentProposal) return
 
-      loadChapter(detail.title ?? title, detail.content)
+      loadChapter(detail.chapterId, detail.title ?? title, detail.content)
       if (editor) {
         suppressingSync.current = true
         editor.commands.setContent(detail.content)
@@ -178,29 +245,23 @@ export function NovelEditor({ chapterId, projectId, onSelectChapter }: NovelEdit
     return () => window.removeEventListener('noval:chapter-updated', handleChapterUpdated)
   }, [chapterId, editor, loadChapter, projectId, title])
 
-  useAutoSave(
-    chapterId,
-    async (id, content) => {
-      await saveChapterContent(id, content)
-    }
-  )
-
   const handleTitleChange = useCallback(async (newTitle: string) => {
     setTitle(newTitle)
-    if (chapterId) {
-      updateChapter(chapterId, { title: newTitle })
+    if (loadedChapterId) {
+      updateChapter(loadedChapterId, { title: newTitle })
+      pendingTitleRef.current = { chapterId: loadedChapterId, title: newTitle }
       if (titleSaveTimerRef.current) clearTimeout(titleSaveTimerRef.current)
       titleSaveTimerRef.current = setTimeout(() => {
-        void persistChapterTitle(chapterId, newTitle)
+        void flushPendingTitle().catch(err => console.error('Chapter title save failed:', err))
       }, 600)
     }
-  }, [chapterId, persistChapterTitle, setTitle, updateChapter])
+  }, [flushPendingTitle, loadedChapterId, setTitle, updateChapter])
 
   const handleTitleBlur = useCallback(() => {
-    if (!chapterId) return
-    if (titleSaveTimerRef.current) clearTimeout(titleSaveTimerRef.current)
-    void persistChapterTitle(chapterId, title, true)
-  }, [chapterId, persistChapterTitle, title])
+    if (!loadedChapterId) return
+    pendingTitleRef.current = { chapterId: loadedChapterId, title }
+    void flushPendingTitle(true).catch(err => console.error('Chapter title save failed:', err))
+  }, [flushPendingTitle, loadedChapterId, title])
 
   const createChapterFromEditor = useCallback(async () => {
     const trimmedTitle = quickChapterTitle.trim()
@@ -222,19 +283,25 @@ export function NovelEditor({ chapterId, projectId, onSelectChapter }: NovelEdit
   }, [])
 
   const handleAccept = useCallback(async () => {
+    const activeChapterId = useEditorStore.getState().loadedChapterId
+    if (activeChapterId) takePendingAgentChapterProposal(activeChapterId)
     acceptAgentChange()
     setAgentDiffSummary(null)
-    if (chapterId) {
-      await saveChapterContent(chapterId, content)
-      markClean()
+    if (activeChapterId) {
+      await saveNow(activeChapterId, useEditorStore.getState().content)
     }
-  }, [chapterId, content, saveChapterContent, markClean])
+  }, [acceptAgentChange, saveNow])
 
-  const handleReject = useCallback(() => {
+  const handleReject = useCallback(async () => {
+    const activeChapterId = useEditorStore.getState().loadedChapterId
+    if (activeChapterId) takePendingAgentChapterProposal(activeChapterId)
     // rejectAgentChange restores content from agentOldContent
     rejectAgentChange()
     setAgentDiffSummary(null)
-  }, [])
+    if (activeChapterId) {
+      await saveNow(activeChapterId, useEditorStore.getState().content)
+    }
+  }, [rejectAgentChange, saveNow])
 
   if (!chapterId) {
     return (
@@ -271,6 +338,7 @@ export function NovelEditor({ chapterId, projectId, onSelectChapter }: NovelEdit
       </div>
       <EditorToolbar editor={editor} />
       <div
+        ref={contentWrapperRef}
         className="editor-content-wrapper"
         style={{ '--editor-font-size': `${fontSize}px` } as React.CSSProperties}
       >
@@ -283,7 +351,9 @@ export function NovelEditor({ chapterId, projectId, onSelectChapter }: NovelEdit
           <div className="agent-proposal-info">
             <span className="agent-proposal-icon">🤖</span>
             <span className="agent-proposal-text">
-              Agent 输出已放入正文，等待确认
+              {agentProposalConflict
+                ? '生成期间正文已变化；接受将使用提案，撤销将保留当前正文'
+                : 'Agent 输出已放入正文，等待确认'}
             </span>
             <span className="agent-proposal-stats">
               <span className="diff-stat-add">+{agentDiffSummary.additions}</span>

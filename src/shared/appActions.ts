@@ -18,6 +18,7 @@ export type AppActionName =
   | 'upsert_outline'
   | 'search_knowledge'
   | 'list_knowledge'
+  | 'read_skill_doc'
   | 'open_panel'
   | 'select_chapter'
 
@@ -37,7 +38,7 @@ export interface AppActionCall {
 
 export type AppUIEffect =
   | { type: 'open_panel'; panel: AppPanel }
-  | { type: 'select_chapter'; chapterId: string }
+  | { type: 'select_chapter'; projectId: string; chapterId: string }
   | { type: 'chapter_proposal'; projectId: string; chapterId: string; title?: string; html: string; oldHtml?: string; sourceName?: string }
   | { type: 'refresh_chapters'; projectId: string }
   | { type: 'chapter_updated'; projectId: string; chapterId: string; title?: string; content?: string }
@@ -61,6 +62,8 @@ export interface AppAgentMessageParams {
   chapterId?: string | null
   currentPanel?: AppPanel | null
   messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>
+  /** The raw user turn for this request. Kept separate from sanitized history for idempotent persistence. */
+  userMessage?: string
   aiParams?: Record<string, unknown>
 }
 
@@ -69,10 +72,13 @@ export interface AppAgentMessageResult {
   conversationId: string
   actionResults: AppActionResult[]
   error?: string
+  /** 用户主动终止（区别于失败）：已执行的动作保留，不应展示为错误。 */
+  aborted?: boolean
 }
 
 export interface AppAgentActionEvent {
   conversationId: string
+  projectId: string
   status: 'started' | 'completed' | 'error'
   action: string
   message: string
@@ -189,6 +195,13 @@ export const APP_ACTION_DEFINITIONS: AppActionDefinition[] = [
     description: '在当前项目知识库中搜索关键词，返回相关参考片段。',
     safety: 'read',
     inputSchema: { query: '必填，搜索词', limit: '可选，返回数量，默认 5' }
+  },
+  {
+    name: 'read_skill_doc',
+    title: '读取技能子文档',
+    description: '读取已挂载写作技能的子文档。技能提示里 <docs> 列出了可读路径；主文档写"详见某某.md"时用它取回细节，不要凭印象猜内容。',
+    safety: 'read',
+    inputSchema: { path: '必填，子文档相对路径，如 references/guides/hook-techniques.md', skill: '可选，技能名称，用于在多个技能间消歧' }
   },
   {
     name: 'list_knowledge',

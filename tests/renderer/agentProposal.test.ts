@@ -92,3 +92,24 @@ describe('agentOutputToHtml', () => {
     expect(extractAgentDrafts(output)).toEqual([])
   })
 })
+
+describe('pending chapter proposals', () => {
+  it('按章节挂起并一次性取走', async () => {
+    const { storePendingAgentChapterProposal, takePendingAgentChapterProposal } = await import('../../src/renderer/lib/agentProposal')
+    storePendingAgentChapterProposal({ chapterId: 'ch-1', html: '<p>新</p>', oldHtml: '<p>旧</p>', sourceName: '写作团队改写' })
+
+    expect(takePendingAgentChapterProposal('ch-other')).toBeNull()
+    const taken = takePendingAgentChapterProposal('ch-1')
+    expect(taken?.oldHtml).toBe('<p>旧</p>')
+    expect(takePendingAgentChapterProposal('ch-1')).toBeNull()
+  })
+
+  it('不同章节的挂起互不覆盖', async () => {
+    const { storePendingAgentChapterProposal, takePendingAgentChapterProposal } = await import('../../src/renderer/lib/agentProposal')
+    storePendingAgentChapterProposal({ chapterId: 'a', html: 'A', sourceName: 's' })
+    storePendingAgentChapterProposal({ chapterId: 'b', html: 'B', sourceName: 's' })
+
+    expect(takePendingAgentChapterProposal('a')?.html).toBe('A')
+    expect(takePendingAgentChapterProposal('b')?.html).toBe('B')
+  })
+})

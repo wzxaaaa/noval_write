@@ -67,3 +67,16 @@ describe('novelEditPlan', () => {
     expect(result?.endParagraphId).toBe('p2')
   })
 })
+
+describe('normalizeDialogueQuotes', () => {
+  it('直角引号统一转成中文双/单引号', async () => {
+    const { normalizeDialogueQuotes } = await import('../../src/shared/novelEditPlan')
+    expect(normalizeDialogueQuotes('他说：「走吧。」她答：『不。』'))
+      .toBe('他说：“走吧。”她答：‘不。’')
+  })
+
+  it('cleanDraftText 交付前完成引号归一', async () => {
+    const { cleanDraftText } = await import('../../src/shared/novelEditPlan')
+    expect(cleanDraftText('「今晚别回来。」')).toBe('“今晚别回来。”')
+  })
+})

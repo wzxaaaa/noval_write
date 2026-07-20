@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS projects (
 CREATE TABLE IF NOT EXISTS chapters (
     id          TEXT PRIMARY KEY,
     project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    parent_id   TEXT REFERENCES chapters(id),
+    parent_id   TEXT REFERENCES chapters(id) ON DELETE SET NULL,
     title       TEXT NOT NULL,
     content     TEXT NOT NULL DEFAULT '',
     sort_order  INTEGER NOT NULL DEFAULT 0,
@@ -52,9 +52,9 @@ CREATE TABLE IF NOT EXISTS provider_configs (
 CREATE TABLE IF NOT EXISTS conversations (
     id          TEXT PRIMARY KEY,
     project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    chapter_id  TEXT REFERENCES chapters(id),
+    chapter_id  TEXT REFERENCES chapters(id) ON DELETE SET NULL,
     title       TEXT,
-    provider_config_id TEXT REFERENCES provider_configs(id),
+    provider_config_id TEXT REFERENCES provider_configs(id) ON DELETE SET NULL,
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -77,8 +77,12 @@ CREATE TABLE IF NOT EXISTS agent_configs (
     role        TEXT NOT NULL,
     system_prompt TEXT NOT NULL,
     model       TEXT NOT NULL,
+    provider_config_id TEXT REFERENCES provider_configs(id) ON DELETE SET NULL,
+    pipeline_role TEXT UNIQUE,
+    is_system   INTEGER NOT NULL DEFAULT 0,
     tools       TEXT NOT NULL DEFAULT '[]',
     parameters  TEXT NOT NULL DEFAULT '{}',
+    category_id TEXT REFERENCES agent_categories(id) ON DELETE SET NULL,
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -87,7 +91,7 @@ CREATE TABLE IF NOT EXISTS agent_groups (
     id          TEXT PRIMARY KEY,
     name        TEXT NOT NULL,
     project_id  TEXT REFERENCES projects(id) ON DELETE SET NULL,
-    collaboration_mode TEXT NOT NULL DEFAULT 'round_robin',
+    collaboration_mode TEXT NOT NULL DEFAULT 'chapter_pipeline',
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -121,6 +125,35 @@ CREATE TABLE IF NOT EXISTS knowledge_doc_chunks (
     PRIMARY KEY (doc_id, chunk_index)
 );
 
+-- Novel Memory
+CREATE TABLE IF NOT EXISTS novel_memories (
+    id                TEXT PRIMARY KEY,
+    project_id        TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    memory_type       TEXT NOT NULL,
+    subject           TEXT NOT NULL DEFAULT '',
+    content           TEXT NOT NULL DEFAULT '',
+    metadata          TEXT NOT NULL DEFAULT '{}',
+    status            TEXT NOT NULL DEFAULT 'active',
+    source_chapter_id TEXT REFERENCES chapters(id) ON DELETE SET NULL,
+    created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Writing Skills (user-imported methodology packages)
+CREATE TABLE IF NOT EXISTS skills (
+    id            TEXT PRIMARY KEY,
+    name          TEXT NOT NULL,
+    description   TEXT NOT NULL DEFAULT '',
+    version       TEXT NOT NULL DEFAULT '',
+    install_path  TEXT NOT NULL,
+    entry_file    TEXT NOT NULL DEFAULT 'SKILL.md',
+    source_kind   TEXT NOT NULL DEFAULT 'folder',
+    source_label  TEXT NOT NULL DEFAULT '',
+    content_chars INTEGER NOT NULL DEFAULT 0,
+    doc_paths     TEXT NOT NULL DEFAULT '[]',
+    installed_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- App Settings
 CREATE TABLE IF NOT EXISTS settings (
     key         TEXT PRIMARY KEY,
@@ -137,3 +170,6 @@ CREATE INDEX IF NOT EXISTS idx_messages_conversation ON conversation_messages(co
 CREATE INDEX IF NOT EXISTS idx_knowledge_docs_project ON knowledge_docs(project_id);
 CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_doc ON knowledge_doc_chunks(doc_id);
 CREATE INDEX IF NOT EXISTS idx_agent_groups_project ON agent_groups(project_id);
+CREATE INDEX IF NOT EXISTS idx_novel_memories_project_type ON novel_memories(project_id, memory_type);
+CREATE INDEX IF NOT EXISTS idx_novel_memories_subject ON novel_memories(project_id, subject);
+CREATE INDEX IF NOT EXISTS idx_novel_memories_chapter ON novel_memories(source_chapter_id);

@@ -41,6 +41,7 @@ export abstract class BaseAIAdapter implements AIAdapter {
     normalized.contextTokens ??= params.context_tokens
     normalized.numCtx ??= params.num_ctx
     normalized.extraBody ??= params.extra_body
+    normalized.thinkingEffort ??= params.thinking_effort
 
     if (!normalized.stopSequences) {
       if (Array.isArray(params.stop_sequences)) {

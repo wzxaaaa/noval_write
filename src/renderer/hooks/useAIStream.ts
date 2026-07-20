@@ -8,8 +8,10 @@ interface AppAgentSendContext {
   currentPanel?: AppPanel | null
 }
 
+const activeSendRequests = new Map<string, symbol>()
+
 export function useAIStream() {
-  const { clearStream, setStreaming, addMessage } = useAIStore()
+  const { clearStream, setConversationStreaming, addMessage } = useAIStore()
 
   useEffect(() => {
     const unsubscribe = window.electronAPI.ai.onToken((data) => {
@@ -19,7 +21,17 @@ export function useAIStream() {
       }
     })
 
-    return unsubscribe
+    const unsubscribeThinking = window.electronAPI.ai.onThinking((data) => {
+      const { currentConversationId, appendStreamThinking } = useAIStore.getState()
+      if (data.conversationId === currentConversationId) {
+        appendStreamThinking(data.thinking)
+      }
+    })
+
+    return () => {
+      unsubscribe()
+      unsubscribeThinking()
+    }
   }, [])
 
   const sendMessage = async (
@@ -29,20 +41,31 @@ export function useAIStream() {
     aiParams?: Record<string, unknown>,
     appAgentContext?: AppAgentSendContext
   ) => {
+    // 流式状态由这里单一管理（按会话），调用方不要再另行维护
+    const requestId = Symbol(conversationId)
+    activeSendRequests.set(conversationId, requestId)
     clearStream()
-    setStreaming(true)
+    setConversationStreaming(conversationId, true)
     const previousMessages = useAIStore.getState().messages.map(({ role, content }) => ({ role, content }))
+    const latestPreviousMessage = previousMessages[previousMessages.length - 1]
+    const isRetryOfUnansweredMessage = latestPreviousMessage?.role === 'user' &&
+      latestPreviousMessage.content === content
+    const outgoingMessages = isRetryOfUnansweredMessage
+      ? previousMessages
+      : [...previousMessages, { role: 'user' as const, content }]
 
-    addMessage({
-      id: `temp-${Date.now()}`,
-      conversation_id: conversationId,
-      role: 'user',
-      content,
-      token_count: null,
-      agent_id: null,
-      metadata: '{}',
-      created_at: new Date().toISOString()
-    })
+    if (!isRetryOfUnansweredMessage) {
+      addMessage({
+        id: `temp-${Date.now()}`,
+        conversation_id: conversationId,
+        role: 'user',
+        content,
+        token_count: null,
+        agent_id: null,
+        metadata: '{}',
+        created_at: new Date().toISOString()
+      })
+    }
 
     try {
       if (appAgentContext) {
@@ -52,10 +75,8 @@ export function useAIStream() {
           projectId: appAgentContext.projectId,
           chapterId: appAgentContext.chapterId,
           currentPanel: appAgentContext.currentPanel,
-          messages: [
-            ...previousMessages,
-            { role: 'user' as const, content }
-          ],
+          messages: outgoingMessages,
+          userMessage: content,
           aiParams
         })
       }
@@ -63,14 +84,15 @@ export function useAIStream() {
       return await window.electronAPI.ai.sendMessage({
         conversationId,
         providerConfigId,
-        messages: [
-          ...previousMessages,
-          { role: 'user' as const, content }
-        ],
+        messages: outgoingMessages,
+        userMessage: content,
         aiParams
       })
     } finally {
-      setStreaming(false)
+      if (activeSendRequests.get(conversationId) === requestId) {
+        activeSendRequests.delete(conversationId)
+        setConversationStreaming(conversationId, false)
+      }
     }
   }
 

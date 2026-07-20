@@ -1,35 +1,52 @@
-import { ipcMain, dialog, BrowserWindow } from 'electron'
+import { app, ipcMain, dialog, BrowserWindow, type IpcMainInvokeEvent } from 'electron'
 import { chapterRepo } from '../db/repositories/chapter.repo'
 import { projectRepo } from '../db/repositories/project.repo'
-import { approvePaths } from '../utils/approved-paths'
+import {
+  approvePath,
+  assertTrustedIpcSender,
+  consumeApprovedPath,
+  type ApprovedPathPurpose
+} from '../utils/approved-paths'
 import { htmlToPlainText } from '../../shared/textMetrics'
 import { createWriteStream } from 'fs'
+import { mkdir, stat } from 'fs/promises'
 import { once } from 'events'
-import { basename, join } from 'path'
+import { basename, extname, isAbsolute, join } from 'path'
 
 export function registerFileHandlers(): void {
-  ipcMain.handle('file:createProject', async (_event, name: string, rootPath: string, agentGroupId?: string | null) => {
-    const project = projectRepo.create(name, rootPath, agentGroupId ? { default_agent_group_id: agentGroupId } : {})
+  handleTrusted('file:createProject', async (_event, name: string, rootPath: string) => {
+    const cleanName = typeof name === 'string' ? name.trim() : ''
+    if (!cleanName) throw new Error('Project name is required')
+    const approvedRoot = await resolveProjectRoot(cleanName, rootPath)
+    const project = projectRepo.create(cleanName, approvedRoot)
     return project
   })
 
-  ipcMain.handle('file:listProjects', async () => {
+  handleTrusted('file:listProjects', async () => {
     return projectRepo.list()
   })
 
-  ipcMain.handle('file:getProject', async (_event, id: string) => {
+  handleTrusted('file:getProject', async (_event, id: string) => {
     return projectRepo.getById(id)
   })
 
-  ipcMain.handle('file:deleteProject', async (_event, id: string) => {
+  handleTrusted('file:deleteProject', async (_event, id: string) => {
     projectRepo.delete(id)
   })
 
-  ipcMain.handle('file:listChapters', async (_event, projectId: string) => {
+  handleTrusted('file:getChapterWordTarget', async (_event, projectId: string) => {
+    return projectRepo.getChapterWordTarget(projectId)
+  })
+
+  handleTrusted('file:setChapterWordTarget', async (_event, projectId: string, value: number | null) => {
+    return projectRepo.setChapterWordTarget(projectId, value ?? null)
+  })
+
+  handleTrusted('file:listChapters', async (_event, projectId: string) => {
     return chapterRepo.listByProject(projectId)
   })
 
-  ipcMain.handle('file:createChapter', async (_event, params: {
+  handleTrusted('file:createChapter', async (_event, params: {
     projectId: string
     parentId?: string | null
     title: string
@@ -46,27 +63,27 @@ export function registerFileHandlers(): void {
     })
   })
 
-  ipcMain.handle('file:saveChapter', async (_event, id: string, content: string) => {
+  handleTrusted('file:saveChapter', async (_event, id: string, content: string) => {
     return chapterRepo.updateContent(id, content)
   })
 
-  ipcMain.handle('file:renameChapter', async (_event, id: string, title: string) => {
+  handleTrusted('file:renameChapter', async (_event, id: string, title: string) => {
     chapterRepo.updateTitle(id, title)
   })
 
-  ipcMain.handle('file:deleteChapter', async (_event, id: string) => {
+  handleTrusted('file:deleteChapter', async (_event, id: string) => {
     chapterRepo.delete(id)
   })
 
-  ipcMain.handle('file:updateChapterOrder', async (_event, chapterIds: string[]) => {
+  handleTrusted('file:updateChapterOrder', async (_event, chapterIds: string[]) => {
     return chapterRepo.reorder(chapterIds)
   })
 
-  ipcMain.handle('file:listChapterVersions', async (_event, chapterId: string) => {
+  handleTrusted('file:listChapterVersions', async (_event, chapterId: string) => {
     return chapterRepo.listVersions(chapterId)
   })
 
-  ipcMain.handle('file:exportProjectTxt', async (event, projectId: string) => {
+  handleTrusted('file:exportProjectTxt', async (event, projectId: string) => {
     const project = projectRepo.getById(projectId)
     if (!project) throw new Error('Project not found')
 
@@ -112,7 +129,7 @@ export function registerFileHandlers(): void {
     }
   })
 
-  ipcMain.handle('file:openFileDialog', async (_event, options: {
+  handleTrusted('file:openFileDialog', async (_event, options: {
     filters?: { name: string; extensions: string[] }[]
     properties?: Array<'openFile' | 'openDirectory' | 'multiSelections'>
   }) => {
@@ -125,11 +142,11 @@ export function registerFileHandlers(): void {
     })
 
     if (result.canceled) return null
-    approvePaths(result.filePaths)
+    await approveDialogPaths(result.filePaths)
     return result.filePaths
   })
 
-  ipcMain.handle('file:saveFileDialog', async (_event, options: {
+  handleTrusted('file:saveFileDialog', async (_event, options: {
     defaultPath?: string
     filters?: { name: string; extensions: string[] }[]
   }) => {
@@ -145,6 +162,62 @@ export function registerFileHandlers(): void {
   })
 }
 
+type TrustedIpcHandler = (event: IpcMainInvokeEvent, ...args: any[]) => any
+
+function handleTrusted(channel: string, handler: TrustedIpcHandler): void {
+  ipcMain.handle(channel, (event, ...args) => {
+    assertTrustedIpcSender(event)
+    return handler(event, ...args)
+  })
+}
+
+async function resolveProjectRoot(projectName: string, requestedRootPath: string): Promise<string> {
+  const managedProjectsDirectory = join(app.getPath('userData'), 'projects')
+  await mkdir(managedProjectsDirectory, { recursive: true })
+
+  if (typeof requestedRootPath === 'string' && isAbsolute(requestedRootPath)) {
+    const approvedRoot = consumeApprovedPath(requestedRootPath, 'project-root')
+    if (!approvedRoot) {
+      throw new Error('Project directory must be selected with the folder picker')
+    }
+    const rootStat = await stat(approvedRoot)
+    if (!rootStat.isDirectory()) throw new Error('Selected project path is not a directory')
+    return approvedRoot
+  }
+
+  // The existing UI sends the project name when the optional path is empty.
+  // Resolve that case into an app-owned directory instead of the process cwd.
+  const directoryName = sanitizeDirectoryName(projectName)
+  const managedProjectPath = join(managedProjectsDirectory, directoryName)
+  await mkdir(managedProjectPath, { recursive: true })
+  return managedProjectPath
+}
+
+async function approveDialogPaths(paths: string[]): Promise<void> {
+  for (const path of paths) {
+    try {
+      const fileStat = await stat(path)
+      const purposes: ApprovedPathPurpose[] = []
+
+      if (fileStat.isDirectory()) {
+        // A directory can be either a project root or a skill package; the
+        // consumer decides which, and each approval is consumed only once.
+        purposes.push('project-root', 'skill-package')
+      } else if (fileStat.isFile()) {
+        const ext = extname(path).toLowerCase()
+        if (['.txt', '.md'].includes(ext)) purposes.push('knowledge-document', 'skill-package')
+        if (['.markdown', '.zip'].includes(ext)) purposes.push('skill-package')
+        if (['.jpg', '.jpeg', '.png', '.webp', '.gif'].includes(ext)) purposes.push('background-image')
+      }
+
+      for (const purpose of purposes) approvePath(path, purpose)
+    } catch {
+      // A picker result may disappear before it can be approved. The consumer
+      // will reject it and ask the user to select it again.
+    }
+  }
+}
+
 async function writeChunk(stream: NodeJS.WritableStream, chunk: string): Promise<void> {
   if (!stream.write(chunk)) {
     await once(stream, 'drain')
@@ -157,4 +230,11 @@ function cleanTitle(title: string): string {
 
 function sanitizeFileName(value: string): string {
   return value.replace(/[\\/:*?"<>|]/g, '_').trim() || 'novel'
+}
+
+function sanitizeDirectoryName(value: string): string {
+  return value
+    .replace(/[\\/:*?"<>|]/g, '_')
+    .replace(/[. ]+$/g, '')
+    .trim() || 'novel'
 }

@@ -51,9 +51,24 @@ export class ConversationRepo {
     return this.getMessageById(id)!
   }
 
+  addUserMessageIfNeeded(conversationId: string, content: string): MessageRow {
+    const latest = getDb().prepare(`
+      SELECT * FROM conversation_messages
+      WHERE conversation_id = ?
+      ORDER BY rowid DESC
+      LIMIT 1
+    `).get(conversationId) as MessageRow | undefined
+
+    if (latest?.role === 'user' && latest.content === content) {
+      return latest
+    }
+
+    return this.addMessage(conversationId, 'user', content)
+  }
+
   getMessages(conversationId: string): MessageRow[] {
     return getDb()
-      .prepare('SELECT * FROM conversation_messages WHERE conversation_id = ? ORDER BY created_at')
+      .prepare('SELECT * FROM conversation_messages WHERE conversation_id = ? ORDER BY created_at, rowid')
       .all(conversationId) as MessageRow[]
   }
 

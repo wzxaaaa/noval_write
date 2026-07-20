@@ -43,8 +43,12 @@ describe('agent runtime tool syntax', () => {
 
   it('interrupts a stream that never emits tokens', async () => {
     vi.useFakeTimers()
+    let underlyingSignal: AbortSignal | null = null
     const promise = streamWithWatchdog(
-      () => new Promise<void>(() => {}),
+      (signal) => {
+        underlyingSignal = signal
+        return new Promise<void>(() => {})
+      },
       {
         getOutputLength: () => 0,
         firstTokenTimeoutMs: 100,
@@ -57,6 +61,7 @@ describe('agent runtime tool syntax', () => {
     await vi.advanceTimersByTimeAsync(1200)
 
     await assertion
+    expect(underlyingSignal?.aborted).toBe(true)
   })
 
   it('interrupts a stream that becomes idle after partial output', async () => {
@@ -76,6 +81,26 @@ describe('agent runtime tool syntax', () => {
     await vi.advanceTimersByTimeAsync(1200)
     outputLength = 1
     await vi.advanceTimersByTimeAsync(1200)
+
+    await assertion
+  })
+
+  it('interrupts a stream when the abort signal fires', async () => {
+    vi.useFakeTimers()
+    const controller = new AbortController()
+    const promise = streamWithWatchdog(
+      () => new Promise<void>(() => {}),
+      {
+        getOutputLength: () => 0,
+        firstTokenTimeoutMs: 5000,
+        idleTimeoutMs: 5000,
+        totalTimeoutMs: 5000,
+        signal: controller.signal
+      }
+    )
+    const assertion = expect(promise).rejects.toThrow('工作流已被用户停止')
+
+    controller.abort()
 
     await assertion
   })

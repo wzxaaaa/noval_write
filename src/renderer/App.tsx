@@ -14,6 +14,7 @@ import { SettingsPanel, type SettingsTab } from './components/settings/SettingsP
 import { useUIStore } from './stores/ui.store'
 import type { AppearanceSettings } from '../shared/appearance'
 import { emitAgentChapterProposal } from './lib/agentProposal'
+import { flushPendingEditorWrites } from './components/editor/editorPersistence'
 
 type Panel = 'chat' | 'agent' | 'knowledge' | 'outline' | 'none'
 
@@ -33,7 +34,20 @@ export default function App() {
     window.electronAPI.settings.getAppearance().then(setAppearance).catch(() => {})
   }, [setAppearance])
 
-  const handleSelectProject = (id: string, chapterId: string | null = null) => {
+  // 同步主题类到 body，让通过 createPortal 渲染到 body 的弹层继承正确的主题变量
+  React.useEffect(() => {
+    document.body.classList.remove('theme-light', 'theme-dark')
+    document.body.classList.add(`theme-${appearance.theme}`)
+  }, [appearance.theme])
+
+  const handleSelectProject = async (id: string, chapterId: string | null = null) => {
+    try {
+      await flushPendingEditorWrites()
+    } catch (error) {
+      console.error('Could not save pending editor changes before switching projects:', error)
+      window.alert('最近的修改保存失败，尚未切换项目。请重试。')
+      return
+    }
     setCurrentProjectId(id)
     setCurrentChapterId(chapterId)
     setShowProjectManager(false)
@@ -52,6 +66,8 @@ export default function App() {
   }, [])
 
   const handleAgentUIEffect = React.useCallback((effect: AppUIEffect) => {
+    if ('projectId' in effect && effect.projectId !== currentProjectId) return
+
     switch (effect.type) {
       case 'open_panel':
         if (effect.panel === 'settings') {
@@ -91,15 +107,16 @@ export default function App() {
         window.dispatchEvent(new CustomEvent('noval:knowledge-updated', { detail: { projectId: effect.projectId } }))
         break
     }
-  }, [openSettings])
+  }, [currentProjectId, openSettings])
 
   React.useEffect(() => {
     const unsubscribe = window.electronAPI.appAgent.onAction(event => {
+      if (event.projectId !== currentProjectId) return
       event.uiEffects?.forEach(handleAgentUIEffect)
     })
 
     return unsubscribe
-  }, [handleAgentUIEffect])
+  }, [currentProjectId, handleAgentUIEffect])
 
   React.useEffect(() => {
     const handleAgentUIEffectEvent = (event: Event) => {
@@ -135,8 +152,8 @@ export default function App() {
             />
           ) : (
             <div className="welcome-screen">
-              <h1>Noval Write</h1>
-              <p>AI 驱动的智能小说编辑器</p>
+              <h1>二维漫写</h1>
+              <p>为长篇创作设计的 AI 写作工作台</p>
               <button onClick={() => setShowProjectManager(true)}>
                 开始创作
               </button>
@@ -144,25 +161,24 @@ export default function App() {
           )
         }
         panel={
-          activePanel !== 'none' ? (
             <div className="right-panel">
-              {activePanel === 'chat' && (
+              <div style={{ display: activePanel === 'chat' ? 'contents' : 'none' }}>
                 <ChatPanel
                   projectId={currentProjectId}
                   chapterId={currentChapterId}
-                  currentPanel={activePanel}
+                  currentPanel="chat"
                   onOpenSettings={openSettings}
                   onChapterSelect={setCurrentChapterId}
                 />
-              )}
-              {activePanel === 'agent' && (
+              </div>
+              <div style={{ display: activePanel === 'agent' ? 'contents' : 'none' }}>
                 <AgentPanel
                   projectId={currentProjectId}
                   chapterId={currentChapterId}
                   onChapterSelect={setCurrentChapterId}
                   onOpenConfig={() => setShowAgentConfig(true)}
                 />
-              )}
+              </div>
               {activePanel === 'knowledge' && (
                 <KnowledgePanel projectId={currentProjectId} />
               )}
@@ -170,8 +186,8 @@ export default function App() {
                 <OutlinePanel projectId={currentProjectId} />
               )}
             </div>
-          ) : null
         }
+        panelVisible={activePanel !== 'none'}
         statusBar={<StatusBar projectId={currentProjectId} chapterId={currentChapterId} />}
       />
 
@@ -195,13 +211,14 @@ export default function App() {
           onSelectProject={handleSelectProject}
           onProjectDeleted={handleProjectDeleted}
           onClose={() => setShowProjectManager(false)}
+          canClose={currentProjectId !== null}
         />
       )}
     </div>
   )
 }
 
-function buildAppearanceStyle(appearance: AppearanceSettings): React.CSSProperties {
+export function buildAppearanceStyle(appearance: AppearanceSettings): React.CSSProperties {
   const fit = appearance.backgroundFit
   const backgroundImage = appearance.backgroundType === 'image' && appearance.backgroundImageUrl
     ? `url("${appearance.backgroundImageUrl.replace(/"/g, '\\"')}")`

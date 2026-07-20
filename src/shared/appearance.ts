@@ -15,15 +15,15 @@ export interface AppearanceSettings {
 }
 
 export const DEFAULT_APPEARANCE_SETTINGS: AppearanceSettings = {
-  theme: 'dark',
+  theme: 'light',
   backgroundType: 'color',
-  backgroundColor: '#0f0f1e',
+  backgroundColor: '#f6f7fb',
   backgroundImagePath: null,
   backgroundImageUrl: null,
-  backgroundOpacity: 0.35,
+  backgroundOpacity: 0.28,
   backgroundBlur: 0,
   backgroundFit: 'cover',
-  surfaceOpacity: 0.96
+  surfaceOpacity: 0.94
 }
 
 export function normalizeAppearanceSettings(input: unknown): AppearanceSettings {

@@ -3,6 +3,7 @@ import { knowledgeDocRepo } from '../../db/repositories/knowledge-doc.repo'
 import { chapterRepo } from '../../db/repositories/chapter.repo'
 import { outlineRepo, type OutlineType } from '../../db/repositories/outline.repo'
 import { validateChapterDraft } from './quality-monitor'
+import { readSkillDoc } from '../skills/skill-docs'
 import type { AppUIEffect } from '../../../shared/appActions'
 
 export type ToolName =
@@ -18,6 +19,7 @@ export type ToolName =
   | 'read_outline'
   | 'write_outline'
   | 'analyze_entity'
+  | 'read_skill_doc'
 
 export interface Tool {
   name: ToolName
@@ -43,7 +45,7 @@ export interface ChapterCreateCallback {
 export class ToolRegistry {
   private tools: Map<string, Tool> = new Map()
 
-  constructor(projectId: string, onChapterWrite?: ChapterWriteCallback, onChapterCreate?: ChapterCreateCallback) {
+  constructor(private readonly projectId: string, onChapterWrite?: ChapterWriteCallback, onChapterCreate?: ChapterCreateCallback) {
     this.registerTool({
       name: 'search_knowledge_base',
       description: '在知识库中搜索相关内容。输入具体关键词（如角色名、地名、专有名词），返回最相关的参考片段。注意：只使用明确匹配的结果，不要凭空编造知识库中没有的内容。',
@@ -53,6 +55,22 @@ export class ToolRegistry {
         return results.map((r, i) =>
           `[${i + 1}] ${r.filename} | ${r.chapterLabel} | 相关度${Math.round(r.score * 100)}%\n${r.content.slice(0, 600)}`
         ).join('\n\n') + '\n\n⚠ 以上为检索到的原文片段，创作时请基于这些内容进行参考，不要添加知识库中不存在的设定或情节。'
+      }
+    })
+
+    this.registerTool({
+      name: 'read_skill_doc',
+      description: '读取已挂载写作技能的子文档。输入技能提示里 <docs> 中列出的相对路径（如 references/guides/hook-techniques.md）。主文档写"详见某某.md"时用它取回细节，不要凭印象猜。',
+      execute: async (input: string) => {
+        const { path, skill } = parseSkillDocInput(input)
+        if (!path) return toolFail('请给出要读取的子文档相对路径，例如：references/guides/hook-techniques.md')
+
+        const result = await readSkillDoc('writingTeam', path, skill)
+        if (!result.ok) return toolFail(result.message)
+        return toolOk(
+          `技能「${result.skillName}」/ ${result.path}\n\n${result.content}`,
+          { skill: result.skillName, path: result.path }
+        )
       }
     })
 
@@ -129,7 +147,7 @@ export class ToolRegistry {
 
     this.registerTool({
       name: 'write_chapter',
-      description: '写入或更新章节内容。输入格式:\nchapter_id: <章节ID>\ncontent:\n<新内容>',
+      description: '写入或更新章节内容。输入格式:\nchapter_id: <章节ID>\ncontent:\n<新内容>\n可选在首行加 title: <章节标题> 以同时更新标题。',
       execute: async (input: string) => {
         const chapterMatch = input.match(/chapter_id:\s*(\S+)/)
         const contentMatch = input.match(/content:\s*([\s\S]*)/)
@@ -138,14 +156,18 @@ export class ToolRegistry {
         }
         const chapterId = chapterMatch[1]
         const newContent = contentMatch[1].trim()
+        const titleMatch = input.match(/(?:^|\n)\s*title:\s*(.+)/)
+        const newTitle = titleMatch ? titleMatch[1].trim() : ''
         const validation = validateChapterDraft(newContent)
         if (!validation.ok) return toolFail(`正文质量检查未通过: ${validation.reason}`)
         const chapter = chapterRepo.getById(chapterId)
         if (!chapter) return toolFail(`未找到章节: ${chapterId}`)
         if (chapter.project_id !== projectId) return toolFail('Chapter does not belong to the current project')
         const oldContent = chapter.content
-        const updated = chapterRepo.updateContent(chapterId, newContent)
-        if (!updated) return toolFail(`章节更新失败: ${chapterId}`)
+        const contentUpdated = chapterRepo.updateContent(chapterId, newContent)
+        if (!contentUpdated) return toolFail(`章节更新失败: ${chapterId}`)
+        if (newTitle) chapterRepo.updateTitle(chapterId, newTitle)
+        const updated = chapterRepo.getById(chapterId) ?? contentUpdated
         onChapterWrite?.(chapterId, oldContent, updated.content)
         return toolOk(`已更新章节 "${updated.title}"，写入 ${newContent.length} 字符`, updated, [
           { type: 'refresh_chapters', projectId },
@@ -181,7 +203,7 @@ export class ToolRegistry {
         onChapterCreate?.(chapter)
         return toolOk(`已创建章节 "${chapter.title}"，ID: ${chapter.id}，写入 ${content.length} 字符`, chapter, [
           { type: 'refresh_chapters', projectId },
-          { type: 'select_chapter', chapterId: chapter.id }
+          { type: 'select_chapter', projectId: this.projectId, chapterId: chapter.id }
         ])
       }
     })
@@ -549,6 +571,29 @@ function normalizeToolResult(result: string | ToolExecutionResult): ToolExecutio
 
 function looksLikeFailureMessage(message: string): boolean {
   return /^(格式错误|未知工具|工具执行失败|正文质量检查未通过|章节标题和正文不能为空|标题和内容不能为空|已拦截|未找到章节|Chapter does not belong)/.test(message)
+}
+
+/**
+ * 解析 read_skill_doc 的输入。
+ * 接受纯路径，也接受 `skill: 名称` + `path: 路径` 的键值写法。
+ */
+export function parseSkillDocInput(input: string): { path: string; skill?: string } {
+  const raw = (input ?? '').trim()
+  if (!raw) return { path: '' }
+
+  const skillMatch = raw.match(/skill\s*[:：]\s*([^\n\r]+)/i)
+  const pathMatch = raw.match(/path\s*[:：]\s*([^\n\r]+)/i)
+
+  if (pathMatch) {
+    return {
+      path: pathMatch[1].trim().replace(/^["'`]|["'`]$/g, ''),
+      skill: skillMatch?.[1].trim().replace(/^["'`]|["'`]$/g, '')
+    }
+  }
+
+  // 纯路径写法：取第一行，剥掉可能的反引号/引号包裹
+  const firstLine = raw.split(/\r?\n/)[0].trim().replace(/^["'`]|["'`]$/g, '')
+  return { path: firstLine, skill: skillMatch?.[1].trim() }
 }
 
 export function parseOutlineToolType(input: string): OutlineType | null {

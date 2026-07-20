@@ -1,11 +1,13 @@
 import { htmlToPlainText } from '../../../shared/textMetrics'
 import { APP_ACTION_DEFINITIONS, getAppActionDefinition, type AppActionCall, type AppActionName, type AppActionResult, type AppPanel } from '../../../shared/appActions'
 import { normalizeChapterContent } from '../../../shared/chapterFormat'
+import { normalizeDialogueQuotes } from '../../../shared/novelEditPlan'
 import { chapterRepo, type ChapterRow } from '../../db/repositories/chapter.repo'
 import { knowledgeDocRepo } from '../../db/repositories/knowledge-doc.repo'
 import { outlineRepo, type OutlineType } from '../../db/repositories/outline.repo'
 import { projectRepo } from '../../db/repositories/project.repo'
 import { retrieverService } from '../knowledge/retriever'
+import { readSkillDoc } from '../skills/skill-docs'
 
 export interface AppActionContext {
   projectId: string
@@ -14,10 +16,20 @@ export interface AppActionContext {
 }
 
 export class ActionRegistry {
+  private chapterTargetLocked = false
+
   constructor(private context: AppActionContext) {}
 
   listDefinitions(): typeof APP_ACTION_DEFINITIONS {
     return APP_ACTION_DEFINITIONS
+  }
+
+  clearChapterTarget(): void {
+    this.context.chapterId = null
+  }
+
+  lockChapterTarget(): void {
+    this.chapterTargetLocked = true
   }
 
   getRuntimeContext(): Record<string, unknown> {
@@ -33,8 +45,7 @@ export class ActionRegistry {
       project: project ? {
         id: project.id,
         name: project.name,
-        root_path: project.root_path,
-        default_agent_group_id: project.default_agent_group_id
+        root_path: project.root_path
       } : null,
       currentPanel: this.context.currentPanel ?? null,
       currentChapter: currentChapter ? {
@@ -99,6 +110,8 @@ export class ActionRegistry {
           return this.searchKnowledge(id, call.input)
         case 'list_knowledge':
           return this.listKnowledge(id)
+        case 'read_skill_doc':
+          return this.readSkillDoc(id, call.input)
         case 'open_panel':
           return this.openPanel(id, call.input)
         case 'select_chapter':
@@ -120,7 +133,13 @@ export class ActionRegistry {
 
   private resolveChapter(id: string, input: Record<string, unknown> | undefined): AppActionResult {
     const chapter = this.findChapter(input)
-    if (!chapter) return fail(id, 'resolve_chapter', '未找到匹配章节')
+    if (!chapter) {
+      if (hasExplicitChapterTarget(input) && !this.chapterTargetLocked) this.context.chapterId = null
+      return fail(id, 'resolve_chapter', '未找到匹配章节')
+    }
+
+    // Bind the resolved target for subsequent actions in the same model round.
+    if (!this.chapterTargetLocked) this.context.chapterId = chapter.id
 
     return ok(id, 'resolve_chapter', `已定位章节「${chapter.title}」`, {
       ...toChapterSummary(chapter),
@@ -135,7 +154,9 @@ export class ActionRegistry {
 
   private readChapter(id: string, input: Record<string, unknown> | undefined): AppActionResult {
     const chapter = this.findChapter(input)
-    if (!chapter) return fail(id, 'read_chapter', '未找到匹配章节')
+    if (!chapter) {
+      return fail(id, 'read_chapter', '未找到匹配章节')
+    }
 
     return ok(id, 'read_chapter', `已读取章节「${chapter.title}」`, {
       ...toChapterSummary(chapter),
@@ -158,9 +179,11 @@ export class ActionRegistry {
       sort_order: nextOrder
     })
 
+    this.context.chapterId = chapter.id
+
     return ok(id, 'create_chapter', `已创建章节「${chapter.title}」`, toChapterSummary(chapter), [
       { type: 'refresh_chapters', projectId: this.context.projectId },
-      { type: 'select_chapter', chapterId: chapter.id }
+      { type: 'select_chapter', projectId: this.context.projectId, chapterId: chapter.id }
     ])
   }
 
@@ -172,8 +195,11 @@ export class ActionRegistry {
     if (!content.trim()) return fail(id, 'propose_chapter_edit', '正文提案不能为空')
 
     const mode = normalizeEditMode(readOptionalString(input, 'mode'))
-    const proposedText = composeChapterText(chapter.content, content, mode)
+    const proposedText = composeChapterText(chapter.content, normalizeDialogueQuotes(content), mode)
     const proposedHtml = normalizeChapterContent(proposedText)
+    if (normalizeComparable(htmlToPlainText(proposedHtml)) === normalizeComparable(htmlToPlainText(chapter.content))) {
+      return fail(id, 'propose_chapter_edit', 'AI 返回的正文与当前章节没有实际差异，未生成确认提案')
+    }
     const sourceName = readOptionalString(input, 'sourceName') || readOptionalString(input, 'source') || '小漫正文提案'
 
     return ok(
@@ -186,7 +212,7 @@ export class ActionRegistry {
         proposedText: truncateText(htmlToPlainText(proposedHtml), 1800)
       },
       [
-        { type: 'select_chapter', chapterId: chapter.id },
+        { type: 'select_chapter', projectId: this.context.projectId, chapterId: chapter.id },
         {
           type: 'chapter_proposal',
           projectId: this.context.projectId,
@@ -209,7 +235,7 @@ export class ActionRegistry {
     if (!content.trim()) return fail(id, 'update_chapter_content', '写入正文不能为空')
 
     const mode = normalizeEditMode(readOptionalString(input, 'mode'))
-    const nextContent = composeChapterText(chapter.content, content, mode)
+    const nextContent = composeChapterText(chapter.content, normalizeDialogueQuotes(content), mode)
 
     const updated = chapterRepo.updateContent(chapter.id, normalizeChapterContent(nextContent))
     if (!updated) return fail(id, 'update_chapter_content', '章节更新失败')
@@ -320,6 +346,22 @@ export class ActionRegistry {
     return ok(id, 'list_knowledge', `已读取 ${docs.length} 个知识库文档`, docs)
   }
 
+  private async readSkillDoc(id: string, input: Record<string, unknown> | undefined): Promise<AppActionResult> {
+    const path = readString(input, 'path').trim()
+    if (!path) return fail(id, 'read_skill_doc', '请给出子文档相对路径，如 references/guides/hook-techniques.md')
+
+    const skillHint = readString(input, 'skill').trim() || undefined
+    const result = await readSkillDoc('xiaoman', path, skillHint)
+    if (!result.ok) return fail(id, 'read_skill_doc', result.message)
+
+    return ok(
+      id,
+      'read_skill_doc',
+      `已读取技能「${result.skillName}」的 ${result.path}`,
+      { skill: result.skillName, path: result.path, content: result.content }
+    )
+  }
+
   private openPanel(id: string, input: Record<string, unknown> | undefined): AppActionResult {
     const panel = normalizePanel(readString(input, 'panel'))
     if (!isPanel(panel)) return fail(id, 'open_panel', `未知面板：${panel}`)
@@ -333,8 +375,10 @@ export class ActionRegistry {
     const chapter = this.findChapter(input)
     if (!chapter) return fail(id, 'select_chapter', '未找到匹配章节')
 
+    if (!this.chapterTargetLocked) this.context.chapterId = chapter.id
+
     return ok(id, 'select_chapter', `已切换到章节「${chapter.title}」`, toChapterSummary(chapter), [
-      { type: 'select_chapter', chapterId: chapter.id }
+      { type: 'select_chapter', projectId: this.context.projectId, chapterId: chapter.id }
     ])
   }
 
@@ -370,7 +414,10 @@ export class ActionRegistry {
       if (byOrdinal) return byOrdinal
     }
 
-    if (!chapterId && !title && this.context.chapterId) {
+    // Only fall back to the current chapter when the action supplied no target.
+    // An explicit-but-unresolved reference must fail instead of silently editing
+    // whichever chapter happens to be open.
+    if (!chapterId && !title && !reference && !ordinal && this.context.chapterId) {
       return chapters.find(row => row.id === this.context.chapterId) ?? null
     }
 
@@ -422,6 +469,12 @@ function fail(id: string, name: string, message: string): AppActionResult {
 function readString(input: Record<string, unknown> | undefined, key: string): string {
   const value = input?.[key]
   return typeof value === 'string' ? value : ''
+}
+
+function hasExplicitChapterTarget(input: Record<string, unknown> | undefined): boolean {
+  if (!input) return false
+  return ['chapterId', 'chapter_id', 'title', 'reference', 'chapter', 'target', 'ordinal']
+    .some(key => input[key] !== undefined && input[key] !== null && String(input[key]).trim() !== '')
 }
 
 function readOptionalString(input: Record<string, unknown> | undefined, key: string): string | null {

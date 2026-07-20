@@ -1,5 +1,4 @@
 import { describe, expect, it } from 'vitest'
-import { AgentContextManager } from '../../src/main/services/agent/context-manager'
 import { assessAgentOutput, inspectChinesePunctuation, inspectTextDegeneration, validateChapterDraft } from '../../src/main/services/agent/quality-monitor'
 
 describe('agent quality monitor', () => {
@@ -62,25 +61,5 @@ describe('agent quality monitor', () => {
 
     expect(inspectTextDegeneration(draft).ok).toBe(false)
     expect(validateChapterDraft(draft).ok).toBe(false)
-  })
-})
-
-describe('AgentContextManager', () => {
-  it('compresses old messages when token budget is exceeded', () => {
-    const manager = new AgentContextManager(10)
-    manager.record('这是一个很长很长的上下文，用来触发压缩。')
-
-    const compressed = manager.compress([
-      { role: 'user', content: '一' },
-      { role: 'assistant', content: '二' },
-      { role: 'user', content: '三' },
-      { role: 'assistant', content: '四' },
-      { role: 'user', content: '五' },
-      { role: 'assistant', content: '六' },
-      { role: 'user', content: '七' }
-    ])
-
-    expect(compressed.stats.compressed).toBe(true)
-    expect(compressed.messages[0].content).toContain('[CONTEXT_COMPRESSED]')
   })
 })

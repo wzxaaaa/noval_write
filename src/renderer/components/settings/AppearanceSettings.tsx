@@ -2,7 +2,7 @@ import React from 'react'
 import { mergeAppearanceSettings, type AppearanceSettings as AppearanceSettingsData } from '../../../shared/appearance'
 import { useUIStore } from '../../stores/ui.store'
 
-const COLOR_PRESETS = ['#0f0f1e', '#111827', '#1f2937', '#fff7ed', '#f8fafc', '#1b1f33', '#201a2f', '#10231f']
+const COLOR_PRESETS = ['#f6f7fb', '#ffffff', '#eef2f6', '#101417', '#151b1f', '#17212b', '#e8f3ff', '#ecfdf5']
 
 export function AppearanceSettings() {
   const appearance = useUIStore(s => s.appearance)
@@ -97,37 +97,59 @@ export function AppearanceSettings() {
           </button>
         </div>
 
-        <label className="appearance-field">
-          <span>背景色</span>
-          <div className="color-row">
-            <input
-              type="color"
-              value={appearance.backgroundColor}
-              onChange={e => void applyAppearance({ backgroundColor: e.target.value, backgroundType: 'color' })}
-            />
-            <input
-              value={appearance.backgroundColor}
-              onChange={e => void applyAppearance({ backgroundColor: e.target.value })}
-              maxLength={7}
-            />
-          </div>
-        </label>
+        {appearance.backgroundType === 'color' ? (
+          <>
+            <label className="appearance-field">
+              <span>背景色</span>
+              <div className="color-row">
+                <input
+                  type="color"
+                  value={appearance.backgroundColor}
+                  onChange={e => void applyAppearance({ backgroundColor: e.target.value, backgroundType: 'color' })}
+                />
+                <input
+                  value={appearance.backgroundColor}
+                  onChange={e => void applyAppearance({ backgroundColor: e.target.value })}
+                  maxLength={7}
+                />
+              </div>
+            </label>
 
-        <div className="color-presets">
-          {COLOR_PRESETS.map(color => (
-            <button
-              key={color}
-              className={appearance.backgroundColor === color ? 'active' : ''}
-              style={{ background: color }}
-              title={color}
-              onClick={() => void applyAppearance({ backgroundColor: color, backgroundType: 'color' })}
-            />
-          ))}
-        </div>
+            <div className="color-presets">
+              {COLOR_PRESETS.map(color => (
+                <button
+                  key={color}
+                  className={appearance.backgroundColor === color ? 'active' : ''}
+                  style={{ background: color }}
+                  title={color}
+                  aria-label={`使用背景色 ${color}`}
+                  onClick={() => void applyAppearance({ backgroundColor: color, backgroundType: 'color' })}
+                />
+              ))}
+            </div>
+          </>
+        ) : appearance.backgroundImageUrl ? (
+          <div
+            className="background-image-preview"
+            role="img"
+            aria-label="当前背景图片预览"
+            style={buildBackgroundPreviewStyle(appearance)}
+          >
+            <span>当前背景图片</span>
+          </div>
+        ) : (
+          <div className="background-image-preview background-image-preview-empty">
+            图片预览不可用，请重新上传
+          </div>
+        )}
 
         <div className="background-image-actions">
-          <button onClick={() => void handleUploadBackground()}>上传图片</button>
-          {appearance.backgroundImagePath && <button onClick={() => void handleClearImage()}>移除图片</button>}
+          <button disabled={saving} onClick={() => void handleUploadBackground()}>
+            {appearance.backgroundImagePath ? '更换图片' : '上传图片'}
+          </button>
+          {appearance.backgroundImagePath && (
+            <button disabled={saving} onClick={() => void handleClearImage()}>移除图片</button>
+          )}
         </div>
       </section>
 
@@ -182,4 +204,14 @@ export function AppearanceSettings() {
       </section>
     </div>
   )
+}
+
+export function buildBackgroundPreviewStyle(appearance: AppearanceSettingsData): React.CSSProperties {
+  return {
+    backgroundImage: appearance.backgroundImageUrl
+      ? `url("${appearance.backgroundImageUrl.replace(/"/g, '\\"')}")`
+      : 'none',
+    backgroundSize: appearance.backgroundFit === 'repeat' ? 'auto' : appearance.backgroundFit,
+    backgroundRepeat: appearance.backgroundFit === 'repeat' ? 'repeat' : 'no-repeat'
+  }
 }

@@ -5,6 +5,8 @@ import type { ToolRegistry } from './tool-registry'
 import { assessAgentOutput, inspectTextDegeneration, type QualityAssessment } from './quality-monitor'
 import { estimateTokenCount } from '../../../shared/textMetrics'
 import type { AppUIEffect } from '../../../shared/appActions'
+import { buildSkillPromptForTarget } from '../skills/skill-prompt'
+import { normalizeAssistantContent, sanitizeChatMessages } from '../../../shared/chatMessages'
 
 const MAX_CONTEXT_TOKENS = 900000
 const MAX_SINGLE_MESSAGE_CHARS = 150000
@@ -36,29 +38,35 @@ export class AgentRuntime {
     agent: AgentConfigRow,
     messages: AIChatMessage[],
     onToken?: (token: string) => void,
-    onThinking?: (thinking: string) => void
+    onThinking?: (thinking: string) => void,
+    signal?: AbortSignal
   ): Promise<AgentRunResult> {
+    throwIfAborted(signal)
     const tools = parseTools(agent.tools, agent.name)
     const params = parseParams(agent.parameters, agent.name)
     const watchdogTimeouts = getWatchdogTimeouts(params)
 
+    // 写作团队共享一份技能挂载：九个岗位拿到同样的方法论规则。
+    const skillPrompt = await buildSkillPromptForTarget('writingTeam')
+
     const systemMessage: AIChatMessage = {
       role: 'system',
-      content: this.buildSystemPrompt(agent, tools)
+      content: this.buildSystemPrompt(agent, tools, skillPrompt)
     }
 
     let allMessages = [systemMessage, ...messages]
-    allMessages = this.trimMessages(allMessages)
+    allMessages = this.trimMessages(sanitizeChatMessages(allMessages))
 
-    const adapter = createAdapterById(agent.model)
+    const adapter = createAdapterById(agent.provider_config_id || agent.model)
     const toolCalls: ToolCall[] = []
     const assistantContents: string[] = []
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+      throwIfAborted(signal)
       let roundContent = ''
       let streamActive = true
       await streamWithWatchdog(
-        () => adapter.chatStream(allMessages, {
+        (watchdogSignal) => adapter.chatStream(allMessages, {
           onToken: (token) => {
             if (!streamActive) return
             roundContent += token
@@ -70,7 +78,7 @@ export class AgentRuntime {
           },
           onComplete: () => {},
           onError: (err) => { throw err }
-        }, params),
+        }, { ...params, signal: watchdogSignal }),
         {
           getOutputLength: () => roundContent.length,
           getOutputText: () => roundContent,
@@ -81,11 +89,13 @@ export class AgentRuntime {
             const degeneration = inspectTextDegeneration(roundContent)
             return degeneration.ok ? null : `Agent 输出重复退化：${degeneration.reason}`
           },
+          signal,
           ...watchdogTimeouts
         }
       ).finally(() => {
         streamActive = false
       })
+      throwIfAborted(signal)
 
       assistantContents.push(roundContent)
       const roundToolCalls = parseAgentToolCalls(roundContent)
@@ -93,8 +103,10 @@ export class AgentRuntime {
 
       const executedThisRound: ToolCall[] = []
       for (const call of roundToolCalls) {
+        throwIfAborted(signal)
         onThinking?.(`[工具调用] 正在执行 ${call.tool}`)
         const result = await this.toolRegistry.execute(call.tool, call.input)
+        throwIfAborted(signal)
         const executed = {
           tool: call.tool,
           input: call.input,
@@ -113,7 +125,8 @@ export class AgentRuntime {
 
       allMessages = this.trimMessages([
         ...allMessages,
-        { role: 'assistant', content: roundContent },
+        // 只出了工具调用、正文为空时也要占位，否则下一轮请求会带一条空 assistant 消息
+        { role: 'assistant', content: normalizeAssistantContent(roundContent) ?? '(本轮仅调用了工具)' },
         {
           role: 'user',
           content: `工具执行结果如下。请基于真实结果继续，不要假设失败的工具已经完成；如果任务完成，请输出最终给用户看的结果。\n${formatToolResults(executedThisRound)}`
@@ -171,7 +184,7 @@ export class AgentRuntime {
     return [...systemMsgs, ...trimmed]
   }
 
-  private buildSystemPrompt(agent: AgentConfigRow, tools: string[]): string {
+  private buildSystemPrompt(agent: AgentConfigRow, tools: string[], skillPrompt = ''): string {
     let prompt = agent.system_prompt
 
     if (tools.length > 0) {
@@ -184,6 +197,7 @@ export class AgentRuntime {
 
     prompt += '\n\n' + this.buildKnowledgeRules()
     prompt += '\n\n' + this.buildNovelProseRules()
+    if (skillPrompt) prompt += '\n\n' + skillPrompt
 
     return prompt
   }
@@ -203,15 +217,29 @@ export class AgentRuntime {
 
   private buildNovelProseRules(): string {
     return `【输出交付标准 — 所有 Agent 必须遵守】
-1. 交付章节正文时，必须使用自然、完整的中文全角标点，尤其是「，。！？；：、」。
+1. 交付章节正文时，必须使用自然、完整的中文全角标点（，。！？；：、）。
+1a. 对白和引用一律使用中文双引号""与单引号''，禁止使用直角引号「」『』；不得擅自改变正文已有的引号风格。
 2. 不要为了制造紧张感而长时间省略逗号、句号或分号。连续叙述超过约 30-35 个汉字时，应根据语义加入停顿。
 3. 动作、感官、心理、环境切换处要有清晰标点；不要写成未经润色的长串句。
 4. create_chapter/write_chapter 的 content 必须是可直接入库的最终小说正文，不要包含工作总结、审核说明、标题包装或标点缺失的草稿。
 5. 所有面向主编或用户的分析、方案、汇报也必须有正常标点；不要输出长串无标点文字。
 6. 工作 Agent 接到任务后要一次性交付可推进结果，不要以“等待下一步任务”“请主编裁定”“是否入库请确认”收尾。
 7. 如果被要求写章节，输出「## 正文」并给出完整可用正文；如果被要求做方案，输出可执行方案和明确结论。
-8. 主编整合子 Agent 结果时，要先修正标点、病句和节奏，再调用写入工具。发现子 Agent 正文缺标点时，不得直接入库。`
+8. 主编整合子 Agent 结果时，要先修正标点、病句和节奏，再调用写入工具。发现子 Agent 正文缺标点时，不得直接入库。
+
+${buildAntiAiFlavorRules()}`
   }
+}
+
+export function buildAntiAiFlavorRules(): string {
+  return `【去 AI 腔硬约束 — 交付正文时必须遵守，违反视为不合格】
+1. 禁止用「不是……而是……」「这不是X，这是Y」「不只是……是……」制造金句，尤其禁止把这种对偶句单独成段做收尾。整章此类句式最多 1 处。
+2. 禁止给情绪、状态、可信度、危险度打分或用伪精确小数/百分比(如「恐慌指数0.91」「可信度-100%」「负荷0.78」)。情绪必须用具体动作、生理反应、环境细节写出来，而不是报一个数。
+3. 专业术语必须由人物的动作、误操作或后果自然带出，禁止成串罗列。同一段落技术名词不超过 2 个，禁止把对白写成技术讲座或名词科普。
+4. 少用单句独立成段来凹节奏(如「延期。」「休眠了。」「是维度。」)。整章这类短段落不超过 3 处，其余情绪靠场景承载。
+5. 比喻要用当前场景里真实存在的具体事物，禁用「深海巨兽/野兽睁眼/手术刀/教科书般/空气凝固」这类通用套路喻体。
+6. 不要什么都向读者解释。默认读者能跟上，删掉名词解释式补充(「XX，即……」「XX，一种……的技术」)和"总结陈词"式的升华句。
+7. 允许口语、断续、不那么工整的真实语感；宁可留一点棱角，也不要把每句都磨成四平八稳的"范文腔"。`
 }
 
 export function shouldAbortAgentRun(data: unknown): boolean {
@@ -296,35 +324,68 @@ interface StreamWatchdogOptions {
   firstTokenTimeoutMs?: number
   idleTimeoutMs?: number
   totalTimeoutMs?: number
+  signal?: AbortSignal
 }
 
 export async function streamWithWatchdog(
-  startStream: () => Promise<void>,
+  startStream: (signal: AbortSignal) => Promise<void>,
   options: StreamWatchdogOptions
 ): Promise<void> {
   const firstTokenTimeoutMs = options.firstTokenTimeoutMs ?? FIRST_TOKEN_TIMEOUT_MS
   const idleTimeoutMs = options.idleTimeoutMs ?? STREAM_IDLE_TIMEOUT_MS
   const totalTimeoutMs = options.totalTimeoutMs ?? STREAM_TOTAL_TIMEOUT_MS
+  throwIfAborted(options.signal)
   const startedAt = Date.now()
   let lastLength = options.getOutputLength()
   let lastProgressAt = startedAt
   let staleNotified = false
   let settled = false
   let watchdog: ReturnType<typeof setInterval> | null = null
+  let abortHandler: (() => void) | null = null
+  const streamAbortController = new AbortController()
 
-  const streamPromise = startStream().finally(() => {
+  const abortUnderlyingStream = (reason: Error) => {
+    if (!streamAbortController.signal.aborted) {
+      streamAbortController.abort(reason)
+    }
+  }
+
+  const streamPromise = Promise.resolve()
+    .then(() => startStream(streamAbortController.signal))
+    .finally(() => {
     settled = true
     if (watchdog) clearInterval(watchdog)
-  })
+    if (abortHandler && options.signal) {
+      options.signal.removeEventListener('abort', abortHandler)
+    }
+    })
 
   const timeoutPromise = new Promise<never>((_, reject) => {
+    const rejectAndAbort = (error: Error) => {
+      abortUnderlyingStream(error)
+      reject(error)
+    }
+    abortHandler = () => {
+      rejectAndAbort(new Error('工作流已被用户停止'))
+    }
+    if (options.signal) {
+      if (options.signal.aborted) {
+        abortHandler()
+        return
+      }
+      options.signal.addEventListener('abort', abortHandler, { once: true })
+    }
     watchdog = setInterval(() => {
       if (settled) return
+      if (options.signal?.aborted) {
+        rejectAndAbort(new Error('工作流已被用户停止'))
+        return
+      }
       const now = Date.now()
       const currentLength = options.getOutputLength()
       const abortReason = options.getAbortReason?.()
       if (abortReason) {
-        reject(new Error(abortReason))
+        rejectAndAbort(new Error(abortReason))
         return
       }
       if (currentLength > lastLength) {
@@ -341,11 +402,11 @@ export async function streamWithWatchdog(
         options.onStaleOutput?.()
       }
       if (now - startedAt >= totalTimeoutMs) {
-        reject(new Error(`Agent 输出超过 ${Math.round(totalTimeoutMs / 1000)} 秒仍未完成，已中断本次调用`))
+        rejectAndAbort(new Error(`Agent 输出超过 ${Math.round(totalTimeoutMs / 1000)} 秒仍未完成，已中断本次调用`))
         return
       }
       if (now - lastProgressAt >= timeout) {
-        reject(new Error(hasOutput
+        rejectAndAbort(new Error(hasOutput
           ? `Agent 已 ${Math.round(idleTimeoutMs / 1000)} 秒没有继续输出，已中断本次调用`
           : `Agent 在 ${Math.round(firstTokenTimeoutMs / 1000)} 秒内没有输出，已中断本次调用`
         ))
@@ -354,7 +415,14 @@ export async function streamWithWatchdog(
   }).finally(() => {
     settled = true
     if (watchdog) clearInterval(watchdog)
+    if (abortHandler && options.signal) {
+      options.signal.removeEventListener('abort', abortHandler)
+    }
   })
 
   await Promise.race([streamPromise, timeoutPromise])
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new Error('工作流已被用户停止')
 }

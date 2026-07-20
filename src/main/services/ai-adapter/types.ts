@@ -27,6 +27,9 @@ export interface AIParams {
   stream_total_timeout_ms?: number
   extraBody?: Record<string, unknown>
   extra_body?: Record<string, unknown>
+  thinkingEffort?: 'default' | 'low' | 'medium' | 'high' | 'max'
+  thinking_effort?: 'default' | 'low' | 'medium' | 'high' | 'max'
+  signal?: AbortSignal
 }
 
 export interface AIChatMessage {

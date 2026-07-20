@@ -2,6 +2,7 @@ import React, { useEffect, useState, useCallback } from 'react'
 import { useProjectStore } from '../../stores/project.store'
 import { normalizeChapterTitle } from '../../../shared/chapterFormat'
 import type { ChapterData } from '../../../preload/types'
+import { flushPendingEditorWrites } from '../editor/editorPersistence'
 
 type DropPosition = 'before' | 'after'
 
@@ -216,6 +217,7 @@ export function Sidebar({
     setExportProgress({ percent: 0, text: '准备导出' })
 
     try {
+      await flushPendingEditorWrites()
       const result = await window.electronAPI.file.exportProjectTxt(projectId)
       if (result.canceled) {
         setExportProgress({ percent: 0, text: '已取消导出' })
@@ -230,16 +232,22 @@ export function Sidebar({
   }
 
   const panelIcons = [
-    { id: 'chat', icon: '◉', title: 'AI 对话' },
-    { id: 'agent', icon: '◇', title: 'Agent 协作' },
-    { id: 'outline', icon: '☰', title: '大纲 / 细纲' },
-    { id: 'knowledge', icon: '▦', title: '知识库' },
+    { id: 'chat', icon: 'AI', title: 'AI 对话' },
+    { id: 'agent', icon: 'AG', title: 'Agent 协作' },
+    { id: 'outline', icon: '纲', title: '大纲 / 细纲' },
+    { id: 'knowledge', icon: '库', title: '知识库' },
   ]
 
   return (
     <div className="sidebar" onClick={() => setContextMenu(null)}>
       <div className="sidebar-header">
-        <h2>Noval Write</h2>
+        <div className="sidebar-brand">
+          <span className="sidebar-brand-mark">漫</span>
+          <div>
+            <h2>二维漫写</h2>
+            <span>AI 小说创作工作台</span>
+          </div>
+        </div>
         <button onClick={onNewProject} title="项目管理" className="sidebar-project-btn">项目</button>
       </div>
 

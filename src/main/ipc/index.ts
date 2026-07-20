@@ -5,6 +5,8 @@ import { registerAgentHandlers } from './agent.ipc'
 import { registerOutlineHandlers } from './outline.ipc'
 import { registerAppAgentHandlers } from './app-agent.ipc'
 import { registerSettingsHandlers } from './settings.ipc'
+import { registerSkillHandlers } from './skill.ipc'
+import { registerLifecycleHandlers } from './lifecycle.ipc'
 
 export function registerAllHandlers(): void {
   registerFileHandlers()
@@ -14,4 +16,6 @@ export function registerAllHandlers(): void {
   registerOutlineHandlers()
   registerAppAgentHandlers()
   registerSettingsHandlers()
+  registerSkillHandlers()
+  registerLifecycleHandlers()
 }

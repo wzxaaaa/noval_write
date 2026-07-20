@@ -1,5 +1,6 @@
 import { knowledgeDocRepo, type KnowledgeDocRow } from '../../db/repositories/knowledge-doc.repo'
 import { chunkText, parseDocument, type TextChunk } from './document-parser'
+import { tokenizeSearchText } from '../../../shared/searchTerms'
 
 export interface SearchResult {
   docId: string
@@ -32,15 +33,12 @@ const STOP_WORDS = new Set([
 ])
 
 function tokenize(text: string): string[] {
-  return text.toLowerCase()
-    .replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/g, ' ')
-    .split(/\s+/)
+  return tokenizeSearchText(text)
     .filter(w => w.length >= 2 && !STOP_WORDS.has(w))
 }
 
 function extractQueryTerms(query: string): { tokens: string[]; rawTerms: string[] } {
-  const cleaned = query.replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/g, ' ')
-  const rawTerms = cleaned.split(/\s+/).filter(w => w.length >= 1)
+  const rawTerms = tokenizeSearchText(query).filter(w => w.length >= 1)
   const tokens = rawTerms.filter(w => w.length >= 2 && !STOP_WORDS.has(w))
   return { tokens, rawTerms }
 }
@@ -89,14 +87,11 @@ class RetrieverService {
     const df: Map<string, number> = new Map()
     for (const doc of docs) {
       const chunks = this.getDocChunks(doc)
-      const seenTerms = new Set<string>()
       for (const chunk of chunks) {
-        for (const term of tokenize(chunk.content)) {
-          seenTerms.add(term)
+        const seenTerms = new Set(tokenize(chunk.content))
+        for (const term of seenTerms) {
+          df.set(term, (df.get(term) || 0) + 1)
         }
-      }
-      for (const term of seenTerms) {
-        df.set(term, (df.get(term) || 0) + 1)
       }
     }
 

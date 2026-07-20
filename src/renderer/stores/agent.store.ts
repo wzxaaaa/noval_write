@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { AgentConfig, AgentGroup, AgentGroupMember, AgentCategory, WorkflowEvent } from '../../preload/types'
+import type { AgentConfig, WorkflowEvent } from '../../preload/types'
 
 interface CompletedSnapshot {
   tokens: string
@@ -8,15 +8,11 @@ interface CompletedSnapshot {
 
 interface AgentState {
   agents: AgentConfig[]
-  categories: AgentCategory[]
-  groups: AgentGroup[]
-  groupMembers: Record<string, AgentGroupMember[]>
   workflowEvents: WorkflowEvent[]
   isRunning: boolean
 
   inputContext: string
   runtimeInput: string
-  selectedGroupId: string | null
   agentTokenBuffer: Record<string, string>
   agentThinkingBuffer: Record<string, string>
   completedSnapshots: Record<number, CompletedSnapshot>
@@ -27,21 +23,12 @@ interface AgentState {
   addAgent: (agent: AgentConfig) => void
   updateAgent: (id: string, updates: Partial<AgentConfig>) => void
   removeAgent: (id: string) => void
-  setCategories: (categories: AgentCategory[]) => void
-  addCategory: (category: AgentCategory) => void
-  updateCategory: (id: string, name: string) => void
-  removeCategory: (id: string) => void
-  setGroups: (groups: AgentGroup[]) => void
-  addGroup: (group: AgentGroup) => void
-  removeGroup: (id: string) => void
-  setGroupMembers: (groupId: string, members: AgentGroupMember[]) => void
   addWorkflowEvent: (event: WorkflowEvent) => void
   clearWorkflowEvents: () => void
   setRunning: (running: boolean) => void
 
   setInputContext: (value: string) => void
   setRuntimeInput: (value: string) => void
-  setSelectedGroupId: (id: string | null) => void
   setAgentTokenBuffer: (buffer: Record<string, string>) => void
   setAgentThinkingBuffer: (buffer: Record<string, string>) => void
   setCompletedSnapshots: (snapshots: Record<number, CompletedSnapshot>) => void
@@ -53,15 +40,11 @@ interface AgentState {
 
 export const useAgentStore = create<AgentState>((set) => ({
   agents: [],
-  categories: [],
-  groups: [],
-  groupMembers: {},
   workflowEvents: [],
   isRunning: false,
 
   inputContext: '',
   runtimeInput: '',
-  selectedGroupId: null,
   agentTokenBuffer: {},
   agentThinkingBuffer: {},
   completedSnapshots: {},
@@ -76,22 +59,6 @@ export const useAgentStore = create<AgentState>((set) => ({
   removeAgent: (id) => set((s) => ({
     agents: s.agents.filter(a => a.id !== id)
   })),
-  setCategories: (categories) => set({ categories }),
-  addCategory: (category) => set((s) => ({ categories: [...s.categories, category] })),
-  updateCategory: (id, name) => set((s) => ({
-    categories: s.categories.map(c => c.id === id ? { ...c, name } : c)
-  })),
-  removeCategory: (id) => set((s) => ({
-    categories: s.categories.filter(c => c.id !== id)
-  })),
-  setGroups: (groups) => set({ groups }),
-  addGroup: (group) => set((s) => ({ groups: [...s.groups, group] })),
-  removeGroup: (id) => set((s) => ({
-    groups: s.groups.filter(g => g.id !== id)
-  })),
-  setGroupMembers: (groupId, members) => set((s) => ({
-    groupMembers: { ...s.groupMembers, [groupId]: members }
-  })),
   addWorkflowEvent: (event) => set((s) => ({
     workflowEvents: [...s.workflowEvents, event]
   })),
@@ -100,7 +67,6 @@ export const useAgentStore = create<AgentState>((set) => ({
 
   setInputContext: (inputContext) => set({ inputContext }),
   setRuntimeInput: (runtimeInput) => set({ runtimeInput }),
-  setSelectedGroupId: (selectedGroupId) => set({ selectedGroupId }),
   setAgentTokenBuffer: (agentTokenBuffer) => set({ agentTokenBuffer }),
   setAgentThinkingBuffer: (agentThinkingBuffer) => set({ agentThinkingBuffer }),
   setCompletedSnapshots: (completedSnapshots) => set({ completedSnapshots }),
@@ -115,7 +81,6 @@ export const useAgentStore = create<AgentState>((set) => ({
     proposalStatus: null,
     runtimeInput: '',
     inputContext: '',
-    selectedGroupId: null,
     isRunning: false,
     workflowEvents: []
   }),

@@ -1,5 +1,6 @@
 import { getDb } from '../connection'
 import { randomUUID } from 'crypto'
+import { WRITING_AGENT_DEFINITIONS, type WritingAgentRole } from '../../../shared/writingAgents'
 
 export interface AgentConfigRow {
   id: string
@@ -8,6 +9,9 @@ export interface AgentConfigRow {
   role: string
   system_prompt: string
   model: string
+  provider_config_id: string | null
+  pipeline_role: WritingAgentRole | null
+  is_system: number
   tools: string
   parameters: string
   category_id: string | null
@@ -20,40 +24,30 @@ export interface AgentConfigCreate {
   role: string
   system_prompt: string
   model: string
+  provider_config_id?: string | null
+  pipeline_role?: WritingAgentRole | null
+  is_system?: boolean
   tools?: string[]
   parameters?: Record<string, unknown>
   category_id?: string | null
 }
 
-export interface AgentCategoryRow {
-  id: string
-  name: string
-  created_at: string
-}
-
-export interface AgentGroupRow {
-  id: string
-  name: string
-  project_id: string | null
-  collaboration_mode: 'round_robin' | 'moderator'
-  created_at: string
-}
-
-export interface AgentGroupMemberRow {
-  group_id: string
-  agent_id: string
-  turn_order: number
-  can_initiate: number
-  is_moderator: number
-  routing_rules: string
+export interface WritingAgentUpdate {
+  provider_config_id?: string | null
+  system_prompt?: string
+  parameters?: Record<string, unknown>
 }
 
 export class AgentConfigRepo {
   create(params: AgentConfigCreate): AgentConfigRow {
     const db = getDb()
     const id = randomUUID()
+    const requestedProviderId = params.provider_config_id !== undefined
+      ? params.provider_config_id
+      : params.model
+    const providerConfigId = resolveProviderConfigId(db, requestedProviderId)
     db.prepare(
-      'INSERT INTO agent_configs (id, name, description, role, system_prompt, model, tools, parameters, category_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+      'INSERT INTO agent_configs (id, name, description, role, system_prompt, model, provider_config_id, pipeline_role, is_system, tools, parameters, category_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
     ).run(
       id,
       params.name,
@@ -61,6 +55,9 @@ export class AgentConfigRepo {
       params.role,
       params.system_prompt,
       params.model,
+      providerConfigId,
+      params.pipeline_role ?? null,
+      params.is_system ? 1 : 0,
       JSON.stringify(params.tools ?? []),
       JSON.stringify(params.parameters ?? {}),
       params.category_id ?? null
@@ -85,7 +82,20 @@ export class AgentConfigRepo {
     if (updates.description !== undefined) { fields.push('description = ?'); values.push(updates.description) }
     if (updates.role !== undefined) { fields.push('role = ?'); values.push(updates.role) }
     if (updates.system_prompt !== undefined) { fields.push('system_prompt = ?'); values.push(updates.system_prompt) }
-    if (updates.model !== undefined) { fields.push('model = ?'); values.push(updates.model) }
+    if (updates.model !== undefined) {
+      fields.push('model = ?')
+      values.push(updates.model)
+      if (updates.provider_config_id === undefined) {
+        fields.push('provider_config_id = ?')
+        values.push(resolveProviderConfigId(db, updates.model))
+      }
+    }
+    if (updates.provider_config_id !== undefined) {
+      fields.push('provider_config_id = ?')
+      values.push(resolveProviderConfigId(db, updates.provider_config_id))
+    }
+    if (updates.pipeline_role !== undefined) { fields.push('pipeline_role = ?'); values.push(updates.pipeline_role) }
+    if (updates.is_system !== undefined) { fields.push('is_system = ?'); values.push(updates.is_system ? 1 : 0) }
     if (updates.tools !== undefined) { fields.push('tools = ?'); values.push(JSON.stringify(updates.tools)) }
     if (updates.parameters !== undefined) { fields.push('parameters = ?'); values.push(JSON.stringify(updates.parameters)) }
     if (updates.category_id !== undefined) { fields.push('category_id = ?'); values.push(updates.category_id) }
@@ -99,108 +109,132 @@ export class AgentConfigRepo {
     getDb().prepare('DELETE FROM agent_configs WHERE id = ?').run(id)
   }
 
-  // Agent Groups
-  createGroup(name: string, projectId?: string | null, collaborationMode: 'round_robin' | 'moderator' = 'round_robin'): AgentGroupRow {
+  getWritingTeam(): AgentConfigRow[] {
+    this.ensureWritingTeam()
+    const roles = WRITING_AGENT_DEFINITIONS.map(definition => definition.role)
+    const placeholders = roles.map(() => '?').join(', ')
+    const rows = getDb()
+      .prepare(`SELECT * FROM agent_configs WHERE pipeline_role IN (${placeholders})`)
+      .all(...roles) as AgentConfigRow[]
+    const order = new Map(WRITING_AGENT_DEFINITIONS.map(definition => [definition.role, definition.order]))
+    return rows.sort((a, b) => (order.get(a.pipeline_role!) ?? 999) - (order.get(b.pipeline_role!) ?? 999))
+  }
+
+  updateWritingAgent(role: WritingAgentRole, updates: WritingAgentUpdate): AgentConfigRow {
+    this.ensureWritingTeam()
+    const agent = this.getByPipelineRole(role)
+    if (!agent) throw new Error(`固定写作团队缺少岗位：${role}`)
+
+    const nextParams = updates.parameters === undefined
+      ? parseParameters(agent.parameters)
+      : updates.parameters
+    nextParams.pipeline_role = role
+
+    this.update(agent.id, {
+      provider_config_id: updates.provider_config_id,
+      model: updates.provider_config_id === null ? '' : updates.provider_config_id ?? agent.model,
+      system_prompt: updates.system_prompt,
+      parameters: nextParams
+    })
+
+    return this.getById(agent.id)!
+  }
+
+  ensureWritingTeam(): AgentConfigRow[] {
     const db = getDb()
-    const id = randomUUID()
-    db.prepare('INSERT INTO agent_groups (id, name, project_id, collaboration_mode) VALUES (?, ?, ?, ?)').run(id, name, projectId ?? null, collaborationMode)
-    if (projectId) {
-      this.bindProjectGroup(projectId, id)
+    const defaultProvider = db
+      .prepare('SELECT id FROM provider_configs ORDER BY is_default DESC, datetime(created_at) ASC LIMIT 1')
+      .get() as { id: string } | undefined
+    const defaultProviderId = defaultProvider?.id ?? null
+
+    for (const definition of WRITING_AGENT_DEFINITIONS) {
+      const existing = this.getByPipelineRole(definition.role) ?? this.findLegacyPipelineAgent(definition.role)
+      const existingProviderId = resolveProviderConfigId(
+        db,
+        existing?.provider_config_id || existing?.model || null
+      )
+      const providerId = existingProviderId ?? defaultProviderId
+      const parameters = {
+        ...definition.defaultParameters,
+        ...parseParameters(existing?.parameters),
+        pipeline_role: definition.role
+      }
+
+      if (existing) {
+        this.update(existing.id, {
+          name: definition.name,
+          description: definition.description,
+          role: definition.title,
+          provider_config_id: providerId,
+          model: providerId ?? '',
+          pipeline_role: definition.role,
+          is_system: true,
+          tools: [],
+          parameters
+        })
+        continue
+      }
+
+      this.create({
+        name: definition.name,
+        description: definition.description,
+        role: definition.title,
+        system_prompt: definition.systemPrompt,
+        model: defaultProviderId ?? '',
+        provider_config_id: defaultProviderId,
+        pipeline_role: definition.role,
+        is_system: true,
+        tools: [],
+        parameters
+      })
     }
-    return this.getGroupById(id)!
+
+    return this.getWritingTeamRowsWithoutEnsuring()
   }
 
-  getGroupById(id: string): AgentGroupRow | undefined {
-    return getDb().prepare('SELECT * FROM agent_groups WHERE id = ?').get(id) as AgentGroupRow | undefined
+  private getWritingTeamRowsWithoutEnsuring(): AgentConfigRow[] {
+    const roles = WRITING_AGENT_DEFINITIONS.map(definition => definition.role)
+    const placeholders = roles.map(() => '?').join(', ')
+    const rows = getDb()
+      .prepare(`SELECT * FROM agent_configs WHERE pipeline_role IN (${placeholders})`)
+      .all(...roles) as AgentConfigRow[]
+    const order = new Map(WRITING_AGENT_DEFINITIONS.map(definition => [definition.role, definition.order]))
+    return rows.sort((a, b) => (order.get(a.pipeline_role!) ?? 999) - (order.get(b.pipeline_role!) ?? 999))
   }
 
-  listGroupsByProject(projectId: string): AgentGroupRow[] {
-    const project = getDb()
-      .prepare('SELECT default_agent_group_id FROM projects WHERE id = ?')
-      .get(projectId) as { default_agent_group_id: string | null } | undefined
-
-    if (project?.default_agent_group_id) {
-      const group = this.getGroupById(project.default_agent_group_id)
-      return group ? [group] : []
-    }
-
-    return getDb()
-      .prepare('SELECT * FROM agent_groups WHERE project_id = ? ORDER BY created_at DESC')
-      .all(projectId) as AgentGroupRow[]
+  private getByPipelineRole(role: WritingAgentRole): AgentConfigRow | undefined {
+    return getDb().prepare('SELECT * FROM agent_configs WHERE pipeline_role = ?').get(role) as AgentConfigRow | undefined
   }
 
-  listGroups(): AgentGroupRow[] {
-    return getDb().prepare('SELECT * FROM agent_groups ORDER BY created_at DESC').all() as AgentGroupRow[]
+  private findLegacyPipelineAgent(role: WritingAgentRole): AgentConfigRow | undefined {
+    const rows = this.list()
+    return rows.find(row => {
+      const params = parseParameters(row.parameters)
+      return params.pipeline_role === role || params.pipelineRole === role
+    })
   }
+}
 
-  bindProjectGroup(projectId: string, groupId: string | null): void {
-    getDb()
-      .prepare("UPDATE projects SET default_agent_group_id = ?, updated_at = datetime('now') WHERE id = ?")
-      .run(groupId, projectId)
+function parseParameters(raw: string | undefined): Record<string, unknown> {
+  if (!raw) return {}
+  try {
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {}
+  } catch {
+    return {}
   }
+}
 
-  updateGroup(id: string, updates: { name?: string; collaboration_mode?: 'round_robin' | 'moderator' }): void {
-    const db = getDb()
-    const fields: string[] = []
-    const values: unknown[] = []
-    if (updates.name !== undefined) { fields.push('name = ?'); values.push(updates.name) }
-    if (updates.collaboration_mode !== undefined) { fields.push('collaboration_mode = ?'); values.push(updates.collaboration_mode) }
-    values.push(id)
-    if (fields.length > 0) {
-      db.prepare(`UPDATE agent_groups SET ${fields.join(', ')} WHERE id = ?`).run(...values)
-    }
-  }
-
-  addGroupMember(groupId: string, agentId: string, turnOrder: number, canInitiate: boolean = true, isModerator: boolean = false, routingRules: Record<string, unknown> = {}): void {
-    getDb().prepare(
-      'INSERT OR REPLACE INTO agent_group_members (group_id, agent_id, turn_order, can_initiate, is_moderator, routing_rules) VALUES (?, ?, ?, ?, ?, ?)'
-    ).run(groupId, agentId, turnOrder, canInitiate ? 1 : 0, isModerator ? 1 : 0, JSON.stringify(routingRules))
-  }
-
-  getGroupMembers(groupId: string): (AgentGroupMemberRow & AgentConfigRow)[] {
-    return getDb().prepare(`
-      SELECT agm.*, ac.* FROM agent_group_members agm
-      JOIN agent_configs ac ON ac.id = agm.agent_id
-      WHERE agm.group_id = ?
-      ORDER BY agm.turn_order
-    `).all(groupId) as (AgentGroupMemberRow & AgentConfigRow)[]
-  }
-
-  removeGroupMember(groupId: string, agentId: string): void {
-    getDb().prepare('DELETE FROM agent_group_members WHERE group_id = ? AND agent_id = ?').run(groupId, agentId)
-  }
-
-  deleteGroup(id: string): void {
-    const db = getDb()
-    db.prepare('UPDATE projects SET default_agent_group_id = NULL WHERE default_agent_group_id = ?').run(id)
-    db.prepare('DELETE FROM agent_groups WHERE id = ?').run(id)
-  }
-
-  // Agent Categories
-  createCategory(name: string): AgentCategoryRow {
-    const db = getDb()
-    const id = randomUUID()
-    db.prepare('INSERT INTO agent_categories (id, name) VALUES (?, ?)').run(id, name)
-    return this.getCategoryById(id)!
-  }
-
-  getCategoryById(id: string): AgentCategoryRow | undefined {
-    return getDb().prepare('SELECT * FROM agent_categories WHERE id = ?').get(id) as AgentCategoryRow | undefined
-  }
-
-  listCategories(): AgentCategoryRow[] {
-    return getDb().prepare('SELECT * FROM agent_categories ORDER BY created_at ASC').all() as AgentCategoryRow[]
-  }
-
-  updateCategory(id: string, name: string): void {
-    getDb().prepare('UPDATE agent_categories SET name = ? WHERE id = ?').run(name, id)
-  }
-
-  deleteCategory(id: string): void {
-    const db = getDb()
-    db.prepare('UPDATE agent_configs SET category_id = NULL WHERE category_id = ?').run(id)
-    db.prepare('DELETE FROM agent_categories WHERE id = ?').run(id)
-  }
+function resolveProviderConfigId(
+  db: ReturnType<typeof getDb>,
+  candidate: string | null | undefined
+): string | null {
+  const providerId = candidate?.trim()
+  if (!providerId) return null
+  const exists = db.prepare('SELECT 1 FROM provider_configs WHERE id = ?').get(providerId)
+  return exists ? providerId : null
 }
 
 export const agentConfigRepo = new AgentConfigRepo()

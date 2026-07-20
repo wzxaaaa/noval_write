@@ -1,11 +1,16 @@
 import { app, BrowserWindow, shell } from 'electron'
 import { join } from 'path'
+import { pathToFileURL } from 'url'
 import { initDatabase } from './db/connection'
 import { registerAllHandlers } from './ipc'
+import { protectWindowClose } from './ipc/lifecycle.ipc'
+import { isTrustedRendererUrl } from './utils/approved-paths'
 
 let mainWindow: BrowserWindow | null = null
 
 function createWindow(): void {
+  const packagedRendererUrl = pathToFileURL(join(__dirname, '../renderer/index.html')).href
+  const configuredRendererUrl = process.env.ELECTRON_RENDERER_URL
   mainWindow = new BrowserWindow({
     width: 1400,
     height: 900,
@@ -17,7 +22,7 @@ function createWindow(): void {
       contextIsolation: true,
       nodeIntegration: false
     },
-    title: 'Noval Write - AI 小说编辑器',
+    title: '二维漫写 - AI 小说编辑器',
     show: false
   })
 
@@ -37,8 +42,26 @@ function createWindow(): void {
     return { action: 'deny' }
   })
 
-  if (process.env.ELECTRON_RENDERER_URL) {
-    mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL)
+  const guardNavigation = (event: Electron.Event, url: string): void => {
+    if (isTrustedRendererUrl(url, configuredRendererUrl, packagedRendererUrl)) return
+
+    event.preventDefault()
+    try {
+      const target = new URL(url)
+      if (['http:', 'https:', 'mailto:'].includes(target.protocol)) {
+        void shell.openExternal(url).catch(() => undefined)
+      }
+    } catch {
+      // Ignore malformed navigation targets.
+    }
+  }
+
+  mainWindow.webContents.on('will-navigate', guardNavigation)
+  mainWindow.webContents.on('will-redirect', guardNavigation)
+  protectWindowClose(mainWindow)
+
+  if (configuredRendererUrl) {
+    mainWindow.loadURL(configuredRendererUrl)
   } else {
     mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
   }

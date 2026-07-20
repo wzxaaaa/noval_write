@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react'
+import React, { useCallback, useEffect, useRef, useState } from 'react'
 import type { ProjectOutline, OutlineType } from '../../../preload/types'
 
 interface OutlinePanelProps {
@@ -18,24 +18,40 @@ export function OutlinePanel({ projectId }: OutlinePanelProps) {
   const [editTitle, setEditTitle] = useState('')
   const [isCreating, setIsCreating] = useState(false)
   const [newTitle, setNewTitle] = useState('')
+  const projectIdRef = useRef(projectId)
+  const loadRequestRef = useRef(0)
 
-  const loadOutlines = useCallback(async () => {
-    if (!projectId) {
-      setOutlines([])
-      return
-    }
-    const list = await window.electronAPI.outline.list(projectId)
+  projectIdRef.current = projectId
+
+  const loadOutlines = useCallback(async (targetProjectId: string) => {
+    const requestId = ++loadRequestRef.current
+    const list = await window.electronAPI.outline.list(targetProjectId)
+    if (requestId !== loadRequestRef.current || projectIdRef.current !== targetProjectId) return
     setOutlines(list)
-  }, [projectId])
+  }, [])
 
   useEffect(() => {
-    void loadOutlines()
-  }, [loadOutlines])
+    loadRequestRef.current += 1
+    setOutlines([])
+    setEditingId(null)
+    setIsCreating(false)
+    setEditContent('')
+    setEditTitle('')
+    setNewTitle('')
+
+    if (projectId) {
+      void loadOutlines(projectId).catch((err) => {
+        if (projectIdRef.current === projectId) {
+          console.error('Failed to load outlines:', err)
+        }
+      })
+    }
+  }, [loadOutlines, projectId])
 
   useEffect(() => {
     const handleOutlineUpdated = (event: Event) => {
       const detail = (event as CustomEvent<OutlineUpdatedDetail>).detail
-      if (detail?.projectId && detail.projectId !== projectId) return
+      if (!projectId || detail?.projectId !== projectId) return
 
       if (detail?.types?.length === 1) {
         setActiveTab(detail.types[0])
@@ -45,14 +61,18 @@ export function OutlinePanel({ projectId }: OutlinePanelProps) {
 
       setEditingId(null)
       setIsCreating(false)
-      void loadOutlines()
+      void loadOutlines(projectId).catch((err) => {
+        if (projectIdRef.current === projectId) {
+          console.error('Failed to refresh outlines:', err)
+        }
+      })
     }
 
     window.addEventListener('noval:outline-updated', handleOutlineUpdated)
     return () => window.removeEventListener('noval:outline-updated', handleOutlineUpdated)
   }, [loadOutlines, projectId])
 
-  const filteredOutlines = outlines.filter(o => o.type === activeTab)
+  const filteredOutlines = outlines.filter(o => o.project_id === projectId && o.type === activeTab)
 
   const startCreate = () => {
     setIsCreating(true)
@@ -61,28 +81,37 @@ export function OutlinePanel({ projectId }: OutlinePanelProps) {
 
   const handleCreate = async () => {
     if (!projectId || !newTitle.trim()) return
+    const targetProjectId = projectId
+    const type = activeTab
+    const title = newTitle.trim()
+    if (projectIdRef.current !== targetProjectId) return
     await window.electronAPI.outline.create({
-      projectId,
-      type: activeTab,
-      title: newTitle.trim(),
+      projectId: targetProjectId,
+      type,
+      title,
       content: ''
     })
+    if (projectIdRef.current !== targetProjectId) return
     setIsCreating(false)
     setNewTitle('')
-    loadOutlines()
+    void loadOutlines(targetProjectId)
   }
 
   const startEdit = (outline: ProjectOutline) => {
+    if (!projectId || outline.project_id !== projectId || projectIdRef.current !== projectId) return
     setEditingId(outline.id)
     setEditContent(outline.content)
     setEditTitle(outline.title)
   }
 
   const saveEdit = async () => {
-    if (!editingId) return
-    await window.electronAPI.outline.update(editingId, { title: editTitle, content: editContent })
+    const targetProjectId = projectId
+    const targetOutline = outlines.find(outline => outline.id === editingId && outline.project_id === targetProjectId)
+    if (!targetProjectId || !targetOutline || projectIdRef.current !== targetProjectId) return
+    await window.electronAPI.outline.update(targetOutline.id, { title: editTitle, content: editContent })
+    if (projectIdRef.current !== targetProjectId) return
     setEditingId(null)
-    loadOutlines()
+    void loadOutlines(targetProjectId)
   }
 
   const cancelEdit = () => {
@@ -92,14 +121,23 @@ export function OutlinePanel({ projectId }: OutlinePanelProps) {
   }
 
   const deleteOutline = async (id: string, title: string) => {
+    const targetProjectId = projectId
+    const targetOutline = outlines.find(outline => outline.id === id && outline.project_id === targetProjectId)
+    if (!targetProjectId || !targetOutline || projectIdRef.current !== targetProjectId) return
     const confirmed = await new Promise<boolean>((resolve) => {
       resolve(window.confirm(`确定要删除「${title}」吗？`))
     })
-    if (!confirmed) return
+    if (!confirmed || projectIdRef.current !== targetProjectId) return
     await window.electronAPI.outline.delete(id)
+    if (projectIdRef.current !== targetProjectId) return
     if (editingId === id) cancelEdit()
-    loadOutlines()
+    void loadOutlines(targetProjectId)
   }
+
+  useEffect(() => () => {
+    projectIdRef.current = null
+    loadRequestRef.current += 1
+  }, [])
 
   if (!projectId) {
     return (

@@ -1,5 +1,7 @@
-import { readFileSync } from 'fs'
+import { readFileSync, statSync } from 'fs'
 import { extname } from 'path'
+
+export const MAX_KNOWLEDGE_DOCUMENT_BYTES = 5 * 1024 * 1024
 
 export interface ParsedDocument {
   text: string
@@ -35,6 +37,13 @@ export function parseDocument(filePath: string): ParsedDocument {
 }
 
 function parseTextFile(filePath: string, ext: string): ParsedDocument {
+  const fileStat = statSync(filePath)
+  if (!fileStat.isFile()) {
+    throw new Error('Selected path is not a file')
+  }
+  if (fileStat.size > MAX_KNOWLEDGE_DOCUMENT_BYTES) {
+    throw new Error(`Knowledge documents cannot exceed ${MAX_KNOWLEDGE_DOCUMENT_BYTES / 1024 / 1024}MB`)
+  }
   const text = readFileSync(filePath, 'utf-8')
   return { text, charCount: text.length, metadata: { format: ext } }
 }
